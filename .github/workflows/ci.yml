@@ -24,5 +24,7 @@ jobs:
       - name: Smoke test (headless)
         env:
           SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
         run: |
-          python -m unittest -v
+          python -m unittest discover -s tests -p "test_*.py" -v
+
