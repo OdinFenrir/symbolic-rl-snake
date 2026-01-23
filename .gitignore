@@ -25,3 +25,10 @@ Thumbs.db
 
 # Runtime artifacts
 state/*.bak
+# runtime state (keep folder, ignore contents)
+state/*
+!state/.gitkeep
+
+# python caches
+__pycache__/
+*.pyc
