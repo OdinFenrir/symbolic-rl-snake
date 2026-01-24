@@ -502,7 +502,7 @@ class SnakeAgent:
             h_score = h_norm * float(config.HEURISTIC_WEIGHT)
 
             r_score = float(rsm_scores.get(move, 0.0)) * float(config.RSM_WEIGHT)
-            bonus = float(config.A_STAR_BONUS) if (a_star_move and move == a_star_move) else 0.0
+            bonus = float(config.A_STAR_BONUS) * h_norm if (a_star_move and move == a_star_move) else 0.0
             final_scores[move] = h_score + r_score + bonus
 
         best_score = max(final_scores.values())

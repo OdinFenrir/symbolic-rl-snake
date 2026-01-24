@@ -6,13 +6,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = [
-  "numpy>=1.24",
   "msgpack>=1.0.7",
   "pygame>=2.5.0",
 ]
 
 [project.urls]
-Repository = "https://github.com/yourname/snake-agent"
+Repository = "https://github.com/OdinFenrir/symbolic-rl-snake"
+
+[project.scripts]
+snake-agent = "snake.__main__:main"
 
 [tool.setuptools]
 packages = ["snake"]

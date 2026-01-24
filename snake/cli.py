@@ -44,6 +44,9 @@ def run(
         "SAVE_GAME_STATE": config.SAVE_GAME_STATE,
         "SAVE_MEMORY": config.SAVE_MEMORY,
         "MAX_STEPS_PER_GAME": config.MAX_STEPS_PER_GAME,
+        "STATE_DIR": config.STATE_DIR,
+        "MEMORY_FILE": config.MEMORY_FILE,
+        "GAME_STATE_FILE": config.GAME_STATE_FILE,
     }
     if state_dir:
         config.set_state_dir(state_dir)

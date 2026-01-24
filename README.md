@@ -11,29 +11,31 @@ Supports both a windowed pygame mode and a fast headless evaluation mode. The ru
 
 ### 1. Install dependencies
 
-`
+```bash
 python -m pip install -r requirements.txt
-`
+```
 
 ### 2. Run locally
 
 Windowed mode (default):
 
-`
+```bash
 python main.py
-`
+```
 
 Headless evaluation:
 
-`
+```bash
 python main.py --no-render --num-games 200
-`
+```
 
 Show the debug overlay (score + path):
 
-`
+```bash
 python main.py --debug
-`
+```
+
+If you prefer the package entry point, `python -m snake` works the same, and after installing via `pip install -e .` you can run `snake-agent` directly.
 
 ## State and persistence
 
