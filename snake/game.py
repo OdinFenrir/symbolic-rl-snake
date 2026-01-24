@@ -159,8 +159,10 @@ class SnakeGame:
         for k in list(self.consecutive_moves.keys()):
             if k != action_str:
                 self.consecutive_moves[k] = 0
-        if self.consecutive_moves[action_str] > 8:
-            reward += config.PENALTY_REPEAT * min(self.consecutive_moves[action_str], 20)
+        count = self.consecutive_moves[action_str]
+        if count > config.REPEAT_THRESHOLD:
+            over = count - config.REPEAT_THRESHOLD
+            reward += config.PENALTY_REPEAT * min(over, config.REPEAT_PENALTY_CAP_STEPS)
 
         if new_head[0] in (0, config.BOARD_SIZE - 1) or new_head[1] in (0, config.BOARD_SIZE - 1):
             reward += config.PENALTY_WALL_HUG
@@ -236,6 +238,9 @@ class SnakeGame:
             self.clock.tick(config.FPS)
 
     def save_game_state(self) -> None:
+        if not config.SAVE_GAME_STATE:
+            return
+
         state = {
             "version": 1,
             "board_size": int(config.BOARD_SIZE),

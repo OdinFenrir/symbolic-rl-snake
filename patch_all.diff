@@ -1,0 +1,389 @@
+﻿diff --git a/snake/config.py b/snake/config.py
+index 9301b15..1103370 100644
+--- a/snake/config.py
++++ b/snake/config.py
+@@ -7,6 +7,7 @@ import logging
+ import os
+ import sys
+ from pathlib import Path
++from typing import Union
+ 
+ # Logging
+ logging.basicConfig(
+@@ -18,13 +19,50 @@ logging.basicConfig(
+ )
+ logger = logging.getLogger("snake")
+ 
+ # Paths
+ REPO_ROOT = Path(__file__).resolve().parents[1]
+-STATE_DIR = REPO_ROOT / "state"
+-STATE_DIR.mkdir(exist_ok=True)
+-MEMORY_FILE = str(STATE_DIR / "symbolic_memory.msgpack")
+-GAME_STATE_FILE = str(STATE_DIR / "game_state.json")
++
++# Allow overriding the state dir for isolated experiments/evals.
++def _resolve_state_dir() -> Path:
++    raw = os.environ.get("SNAKE_STATE_DIR")
++    if raw:
++        return Path(raw).expanduser().resolve()
++    return (REPO_ROOT / "state").resolve()
++
++
++STATE_DIR = _resolve_state_dir()
++STATE_DIR.mkdir(parents=True, exist_ok=True)
++
++MEMORY_FILE = str(STATE_DIR / "symbolic_memory.msgpack")
++GAME_STATE_FILE = str(STATE_DIR / "game_state.json")
++
++# Persistence toggles (useful for evaluation)
++SAVE_MEMORY: bool = True
++SAVE_GAME_STATE: bool = True
++
++
++def set_state_dir(state_dir: Union[str, Path]) -> None:
++    """Override the directory used for game_state + memory files at runtime."""
++    global STATE_DIR, MEMORY_FILE, GAME_STATE_FILE
++    STATE_DIR = Path(state_dir).expanduser().resolve()
++    STATE_DIR.mkdir(parents=True, exist_ok=True)
++    MEMORY_FILE = str(STATE_DIR / "symbolic_memory.msgpack")
++    GAME_STATE_FILE = str(STATE_DIR / "game_state.json")
+ 
+ # Gameplay config
+ BOARD_SIZE = int(os.environ.get("SNAKE_BOARD_SIZE", 15))
+ MAX_LIFE = float(os.environ.get("SNAKE_MAX_LIFE", 300))
+ INITIAL_LIFE = MAX_LIFE
+ 
+ # Game reward parameters
+ REWARD_FOOD = float(os.environ.get("SNAKE_REWARD_FOOD", 50))
+ PENALTY_DEATH = float(os.environ.get("SNAKE_PENALTY_DEATH", -100))
+ PENALTY_STEP = float(os.environ.get("SNAKE_PENALTY_STEP", -0.1))
+ PENALTY_WALL_HUG = float(os.environ.get("SNAKE_PENALTY_WALL_HUG", -0.1))
+-PENALTY_REPEAT = float(os.environ.get("SNAKE_PENALTY_REPEAT", -2.5))
++
++# Repeat penalty is applied per-step beyond a threshold and capped.
++REPEAT_THRESHOLD = int(os.environ.get("SNAKE_REPEAT_THRESHOLD", 8))
++REPEAT_PENALTY_CAP_STEPS = int(os.environ.get("SNAKE_REPEAT_PENALTY_CAP_STEPS", 12))
++PENALTY_REPEAT = float(os.environ.get("SNAKE_PENALTY_REPEAT", -0.35))
+ 
+ # Agent/Memory config
+ MEMORY_MAX_ENTRIES = int(os.environ.get("SNAKE_MEMORY_MAX_ENTRIES", 50000))
+ MEMORY_SAVE_INTERVAL = int(os.environ.get("SNAKE_MEMORY_SAVE_INTERVAL", 10))
+ RSM_MAX_DEPTH = int(os.environ.get("SNAKE_RSM_MAX_DEPTH", 3))
+ HEURISTIC_WEIGHT = float(os.environ.get("SNAKE_HEURISTIC_WEIGHT", 0.55))
+ RSM_WEIGHT = float(os.environ.get("SNAKE_RSM_WEIGHT", 0.45))
+ A_STAR_BONUS = float(os.environ.get("SNAKE_ASTAR_BONUS", 0.25))
+ 
+ # Run config
+ FPS = int(os.environ.get("SNAKE_FPS", 30))
+ UI_DEBUG_MODE = bool(int(os.environ.get("SNAKE_UI_DEBUG_MODE", "0")))
+ MAX_STEPS_PER_GAME = int(os.environ.get("SNAKE_MAX_STEPS_PER_GAME", 2000))
+
+diff --git a/snake/game.py b/snake/game.py
+index 84227eb..aacd77f 100644
+--- a/snake/game.py
++++ b/snake/game.py
+@@ -160,7 +160,10 @@ class SnakeGame:
+             if k != action_str:
+                 self.consecutive_moves[k] = 0
+         if self.consecutive_moves[action_str] > 8:
+-            reward += config.PENALTY_REPEAT * min(self.consecutive_moves[action_str], 20)
++            count = self.consecutive_moves[action_str]
++            if count > config.REPEAT_THRESHOLD:
++                over = count - config.REPEAT_THRESHOLD
++                reward += config.PENALTY_REPEAT * min(over, config.REPEAT_PENALTY_CAP_STEPS)
+ 
+         if new_head[0] in (0, config.BOARD_SIZE - 1) or new_head[1] in (0, config.BOARD_SIZE - 1):
+             reward += config.PENALTY_WALL_HUG
+@@ -236,6 +239,9 @@ class SnakeGame:
+             self.clock.tick(config.FPS)
+ 
+     def save_game_state(self) -> None:
++        if not config.SAVE_GAME_STATE:
++            return
++
+         state = {
+             "version": 1,
+             "board_size": int(config.BOARD_SIZE),
+
+diff --git a/snake/cli.py b/snake/cli.py
+index 271ff05..e44a7a5 100644
+--- a/snake/cli.py
++++ b/snake/cli.py
+@@ -36,8 +36,18 @@ def run(
+     max_steps: Optional[int],
+     log_jsonl: Optional[str],
+     save_every: Optional[int],
++    state_dir: Optional[str],
++    no_save: bool,
+ ) -> int:
+     config.UI_DEBUG_MODE = bool(debug)
++    if state_dir:
++        config.set_state_dir(state_dir)
++
++    # Evaluation mode: allow loading, but disable writes.
++    if no_save:
++        config.SAVE_GAME_STATE = False
++        config.SAVE_MEMORY = False
++
+     if max_steps is not None:
+         config.MAX_STEPS_PER_GAME = int(max_steps)
+ 
+@@ -173,6 +183,8 @@ def run(
+         # Safety totals (optional: only if session counters exist)
+         try:
+             logger.info("Safety totals: rejects=%d forced=%d", session_safety_rejects, session_safety_forced)
++            if total_steps > 0:
++                logger.info("forced_rate=%.2f%%", 100.0 * session_safety_forced / float(total_steps))
+         except NameError:
+             pass
+     return 0
+@@ -204,6 +216,23 @@ def main(argv: Optional[list[str]] = None) -> int:
+         help="Override memory save interval (episodes). Defaults to config.MEMORY_SAVE_INTERVAL.",
+     )
+ 
++    parser.add_argument(
++        "--state-dir",
++        type=str,
++        default=None,
++        help="Override state directory (default: state/). Useful for isolated runs.",
++    )
++    parser.add_argument(
++        "--no-save",
++        action="store_true",
++        help="Do not write game_state or memory to disk (evaluation mode).",
++    )
++    parser.add_argument(
++        "--eval",
++        action="store_true",
++        help="Alias for --no-save (kept for convenience).",
++    )
++
+     args = parser.parse_args(argv)
+ 
+     if args.profile:
+@@ -218,6 +247,8 @@ def main(argv: Optional[list[str]] = None) -> int:
+             max_steps=args.max_steps,
+             log_jsonl=args.log_jsonl,
+             save_every=args.save_every,
++            state_dir=args.state_dir,
++            no_save=args.no_save or args.eval,
+         )
+         profiler.disable()
+         stats = pstats.Stats(profiler).sort_stats("cumulative")
+@@ -234,4 +265,6 @@ def main(argv: Optional[list[str]] = None) -> int:
+         max_steps=args.max_steps,
+         log_jsonl=args.log_jsonl,
+         save_every=args.save_every,
++        state_dir=args.state_dir,
++        no_save=args.no_save or args.eval,
+     )
+
+diff --git a/snake/memory.py b/snake/memory.py
+index 09cd721..cdd6d64 100644
+--- a/snake/memory.py
++++ b/snake/memory.py
+@@ -17,7 +17,6 @@ from collections import defaultdict
+ from typing import Any, Deque, Dict, Optional, Tuple, Iterable
+ 
+ import msgpack
+-import numpy as np
+ 
+ from . import config
+ 
+@@ -33,6 +32,11 @@ def _deep_tuple(x: Any) -> Any:
+     return x
+ 
+ 
++def _sign_i(x: int) -> int:
++    """Return -1, 0, or 1 depending on the sign of x (numpy-free)."""
++    return (x > 0) - (x < 0)
++
++
+ class SymbolicMemory:
+     """State-action memory with lightweight generalization and recursive scoring."""
+ 
+@@ -53,7 +57,7 @@ class SymbolicMemory:
+ 
+         # Food direction vector (sign only)
+         food_dir = (
+-            (int(np.sign(food[0] - head[0])), int(np.sign(food[1] - head[1])))
++            (_sign_i(food[0] - head[0]), _sign_i(food[1] - head[1]))
+             if food
+             else (0, 0)
+         )
+@@ -87,12 +91,19 @@ class SymbolicMemory:
+         )
+ 
+         safe_moves = []
++        tail = snake[-1]
+         for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+             new_head = (head[0] + dr, head[1] + dc)
+-            is_wall = not (0 <= new_head[0] < config.BOARD_SIZE and 0 <= new_head[1] < config.BOARD_SIZE)
+-            is_self = new_head in snake
+-            if not is_wall and not is_self:
+-                safe_moves.append((dr, dc))
++            if not (0 <= new_head[0] < config.BOARD_SIZE and 0 <= new_head[1] < config.BOARD_SIZE):
++                continue
++
++            if new_head in snake:
++                will_eat = (food is not None and new_head == food)
++                # Moving into the current tail is legal only if the tail will move away (i.e., not eating).
++                if not (new_head == tail and not will_eat):
++                    continue
++
++            safe_moves.append((dr, dc))
+ 
+         return {
+             "snake_head": head,
+@@ -112,18 +123,24 @@ class SymbolicMemory:
+         for move in state["safe_moves"]:
+             new_head = (state["snake_head"][0] + move[0], state["snake_head"][1] + move[1])
+ 
+-            # Simulate body advance (tail moves)
++            # Simulate body advance (tail moves unless we ate the food).
+             from collections import deque
+-            temp_snake = deque([new_head] + list(state["snake_body"])[:-1])
++            ate = (state.get("food") is not None and new_head == state.get("food"))
++            if ate:
++                temp_snake = deque([new_head] + list(state["snake_body"]))
++                next_food = None  # after eating, new food is unknown to the lookahead
++            else:
++                temp_snake = deque([new_head] + list(state["snake_body"])[:-1])
++                next_food = state.get("food")
+ 
+-            key = self.create_state_key(temp_snake, state["food"], move)
++            key = self.create_state_key(temp_snake, next_food, move)
+ 
+             state_data = self.memory.get(key, {})
+             action_str = f"{move[0]},{move[1]}"
+             if action_str in state_data.get("actions", {}):
+                 scores[move] = float(state_data["actions"][action_str]["avg_reward"])
+ 
+-            new_state = self.create_symbolic_state(temp_snake, state["food"], move)
++            new_state = self.create_symbolic_state(temp_snake, next_food, move)
+             future_scores = self.recursive_reasoning(new_state, depth - 1)
+ 
+             if future_scores:
+@@ -187,7 +204,7 @@ class SymbolicMemory:
+         self.memory = {k: self.memory[k] for k in sorted_keys[: config.MEMORY_MAX_ENTRIES]}
+         self.is_modified = True
+ 
+-    def _decode_payload(self, blob: bytes) -> Dict[Tuple, Dict[str, Any]]:
++    def _decode_payload(self, blob: bytes) -> Tuple[Dict[Tuple, Dict[str, Any]], bool]:
+         """Decode either legacy dict format or v2 payload format."""
+         obj = msgpack.unpackb(
+             blob,
+@@ -209,7 +226,7 @@ class SymbolicMemory:
+                     if not isinstance(k, tuple) or not isinstance(v, dict):
+                         continue
+                     mem[k] = v
+-            return mem
++            return mem, False
+ 
+         # legacy format: a dict with tuple-ish keys
+         if isinstance(obj, dict):
+@@ -218,7 +235,7 @@ class SymbolicMemory:
+                 k = _deep_tuple(k)
+                 if isinstance(k, tuple) and isinstance(v, dict):
+                     mem2[k] = v
+-            return mem2
++            return mem2, True
+ 
+         raise ValueError("Unsupported memory payload type")
+ 
+@@ -227,14 +244,15 @@ class SymbolicMemory:
+         if not os.path.exists(config.MEMORY_FILE):
+             logger.info("No memory file found; starting fresh")
+             self.memory = {}
++            self.is_modified = False
+             return
+ 
+-        def _try_load(path: str) -> Dict[Tuple, Dict[str, Any]]:
++        def _try_load(path: str) -> Tuple[Dict[Tuple, Dict[str, Any]], bool]:
+             with open(path, "rb") as f:
+                 return self._decode_payload(f.read())
+ 
+         try:
+-            self.memory = _try_load(config.MEMORY_FILE)
++            self.memory, legacy = _try_load(config.MEMORY_FILE)
+         except Exception as e:
+             logger.error("Load failed: %s", e)
+ 
+@@ -244,7 +262,7 @@ class SymbolicMemory:
+                     shutil.copy(backup_file, config.MEMORY_FILE)
+                     logger.warning("Restored memory file from backup")
+                     # One-shot retry only
+-                    self.memory = _try_load(config.MEMORY_FILE)
++                    self.memory, legacy = _try_load(config.MEMORY_FILE)
+                 except Exception as bak_e:
+                     logger.error("Backup load failed: %s", bak_e)
+                     # Preserve the broken file for inspection
+@@ -268,12 +286,13 @@ class SymbolicMemory:
+         )
+         logger.info("Loaded %d states from %s", len(self.memory), config.MEMORY_FILE)
+ 
+-        # If file was legacy (no version wrapper), migrate on next save.
+-        # We keep it lightweight: mark modified so your normal save cadence rewrites it in v2.
+-        self.is_modified = True
++        # Only rewrite on next save if we loaded a legacy payload.
++        self.is_modified = bool(legacy)
+ 
+     def save_memory(self) -> None:
+         """Save memory with a backup file (v2 format, atomic write)."""
++        if not config.SAVE_MEMORY:
++            return
+         if not self.is_modified:
+             return
+
+diff --git a/snake/agent.py b/snake/agent.py
+index 986268c..a5df7fa 100644
+--- a/snake/agent.py
++++ b/snake/agent.py
+@@ -467,7 +467,9 @@ class SnakeAgent:
+     ) -> Tuple[Move, Dict[Move, float]]:
+         final_scores: Dict[Move, float] = {}
+ 
+-        max_h = max(heuristic_scores.values()) if heuristic_scores else 1.0
++        h_min = min(heuristic_scores.values()) if heuristic_scores else 0.0
++        h_max = max(heuristic_scores.values()) if heuristic_scores else 0.0
++        denom = (h_max - h_min)
+         a_star_move: Optional[Move] = None
+ 
+         if a_star_path:
+@@ -477,7 +479,12 @@ class SnakeAgent:
+                 a_star_move = (dr, dc)
+ 
+         for move in safe_moves:
+-            h_score = (heuristic_scores.get(move, 0.0) / max_h if max_h > 0 else 0.0) * config.HEURISTIC_WEIGHT
++            h_raw = float(heuristic_scores.get(move, h_min))
++            if denom > 1e-9:
++                h_norm = (h_raw - float(h_min)) / float(denom)
++            else:
++                h_norm = 0.0
++            h_score = h_norm * float(config.HEURISTIC_WEIGHT)
+             r_score = float(rsm_scores.get(move, 0.0)) * config.RSM_WEIGHT
+             bonus = config.A_STAR_BONUS if (a_star_move and move == a_star_move) else 0.0
+             final_scores[move] = h_score + r_score + bonus
+@@ -490,7 +497,7 @@ class SnakeAgent:
+     # ----------------------------
+     # Main decision
+     # ----------------------------
+-    def choose_action(self, snake: Deque[Cell], food: Optional[Cell], direction: Move) -> Tuple[Move, Dict[str, Any]]:
++    def choose_action(self, snake: Deque[Cell], food: Optional[Cell], direction: Move, life: Optional[float] = None) -> Tuple[Move, Dict[str, Any]]:
+         self.decision_count += 1
+ 
+         # Use tail-rule safe moves (more accurate than "new_head in snake" checks).
+
+diff --git a/README.md b/README.md
+index bcd75be..6b619c4 100644
+--- a/README.md
++++ b/README.md
+@@ -72,6 +72,9 @@ del state\game_state.json
+ - `--debug`       : enable debug overlay in windowed mode
+ - `--seed SEED`   : set RNG seed for reproducibility
+ - `--max-steps N` : per-game safety cap (overrides config)
++- `--state-dir DIR` : override the state directory (isolated evaluations / experiments)
++- `--no-save` : do not write game_state or memory to disk (evaluation mode)
++- `--eval` : alias for `--no-save`
+ 
+ ## Repository structure

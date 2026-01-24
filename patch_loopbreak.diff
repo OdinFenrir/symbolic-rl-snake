@@ -1,0 +1,106 @@
+﻿diff --git a/snake/agent.py b/snake/agent.py
+index 8f1c917..ec7acf7 100644
+--- a/snake/agent.py
++++ b/snake/agent.py
+@@ -59,11 +59,18 @@ class SnakeAgent:
+         self._ep_safety_rejects = 0
+         self._ep_safety_forced = 0
+ 
++
++        # Short-term loop breaking (local-only; resets each episode)
++        self._recent_heads: Deque[Cell] = deque(maxlen=32)
++        self._recent_moves: Deque[Move] = deque(maxlen=16)
+     def begin_episode(self) -> None:
+         """Reset per-episode instrumentation counters."""
+         self._ep_safety_rejects = 0
+         self._ep_safety_forced = 0
+ 
++        self._recent_heads.clear()
++        self._recent_moves.clear()
++
+     def end_episode_stats(self) -> dict:
+         """Return per-episode instrumentation stats."""
+         return {
+@@ -354,6 +361,40 @@ class SnakeAgent:
+ 
+         return scores
+ 
++    def _cycle_penalty(self, move: Move, snake_head: Cell, direction: Move, life: Optional[float]) -> float:
++        """Small penalty to discourage tight cycles / oscillations.
++
++        This is intentionally *soft* (does not veto moves). When life is low, we
++        reduce the penalty so the agent can prioritize reaching food.
++        """
++        nr = snake_head[0] + move[0]
++        nc = snake_head[1] + move[1]
++        new_head = (nr, nc)
++
++        # Base penalty for revisiting recent head positions (cycle breaking).
++        penalty = 0.0
++        if new_head in self._recent_heads:
++            # More recent revisits get a larger penalty.
++            recent = list(self._recent_heads)
++            idx = recent.index(new_head)  # 0 = most recent
++            penalty += 0.35 * (1.0 - min(1.0, float(idx) / 10.0))
++
++        # Mild penalty for U-turns (often correlates with oscillation).
++        if move == (-direction[0], -direction[1]):
++            penalty += 0.10
++
++        # Scale down penalties when starving.
++        if life is not None:
++            life_f = float(life)
++            thresh = 0.30 * float(config.MAX_LIFE)
++            if thresh > 0:
++                urgency = max(0.0, min(1.0, (thresh - life_f) / thresh))
++                penalty *= (1.0 - 0.85 * urgency)
++
++        return penalty
++
++
++
+     def _combine_scores(
+         self,
+         heuristic_scores: Dict[Move, float],
+@@ -406,6 +447,9 @@ class SnakeAgent:
+         pre_state = self.symbolic_memory.create_symbolic_state(snake, food, direction)
+         pre_state["safe_moves"] = safe_moves
+ 
++        # Track recent positions for soft cycle breaking.
++        self._recent_heads.appendleft(snake[0])
++
+         debug_info: Dict[str, Any] = {}
+         if not safe_moves:
+             return self.rng.choice(list(self.actions.keys())), debug_info
+@@ -425,5 +469,18 @@ class SnakeAgent:
+         debug_info["a_star_path"] = a_star_path
+ 
+         best, final_scores = self._combine_scores(heuristic_scores, rsm_scores, a_star_path, safe_moves, snake[0])
++
++        # Apply soft loop/oscillation penalties and re-select.
++        for mv in list(final_scores.keys()):
++            final_scores[mv] -= self._cycle_penalty(mv, snake[0], direction, life)
++
++        best_score = max(final_scores.values())
++        best_moves = [m for m, s in final_scores.items() if s == best_score]
++        best = self.rng.choice(best_moves)
++
++        # Update short-term history with the chosen transition.
++        self._recent_moves.appendleft(best)
++        self._recent_heads.appendleft((snake[0][0] + best[0], snake[0][1] + best[1]))
++
+         debug_info["final_scores"] = final_scores
+         return best, debug_info
+diff --git a/snake/cli.py b/snake/cli.py
+index ccba024..6dcfc2b 100644
+--- a/snake/cli.py
++++ b/snake/cli.py
+@@ -194,7 +194,7 @@ def main(argv: Optional[list[str]] = None) -> int:
+     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+ 
+     parser = argparse.ArgumentParser(description="Snake Agent")
+-    parser.add_argument("--num-games", type=int, default=10, help="Number of games to run")
++    parser.add_argument("--num-games", "--games", type=int, default=10, help="Number of games to run")
+     parser.add_argument("--no-render", action="store_true", help="Disable window rendering (headless)")
+     parser.add_argument("--load-state", action="store_true", help="Resume from saved state in state/game_state.json")
+     parser.add_argument("--debug", action="store_true", help="Enable debug overlay (windowed mode)")

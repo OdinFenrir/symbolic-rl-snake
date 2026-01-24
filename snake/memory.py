@@ -16,8 +16,8 @@ import time
 from collections import defaultdict
 from typing import Any, Deque, Dict, Optional, Tuple, Iterable
 
+import errno
 import msgpack
-import numpy as np
 
 from . import config
 
@@ -31,6 +31,11 @@ def _deep_tuple(x: Any) -> Any:
     if isinstance(x, (list, tuple)):
         return tuple(_deep_tuple(i) for i in x)
     return x
+
+
+def _sign_i(x: int) -> int:
+    """Return -1, 0, or 1 depending on the sign of x (numpy-free)."""
+    return (x > 0) - (x < 0)
 
 
 class SymbolicMemory:
@@ -53,7 +58,7 @@ class SymbolicMemory:
 
         # Food direction vector (sign only)
         food_dir = (
-            (int(np.sign(food[0] - head[0])), int(np.sign(food[1] - head[1])))
+            (_sign_i(food[0] - head[0]), _sign_i(food[1] - head[1]))
             if food
             else (0, 0)
         )
@@ -87,12 +92,19 @@ class SymbolicMemory:
         )
 
         safe_moves = []
+        tail = snake[-1]
         for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
             new_head = (head[0] + dr, head[1] + dc)
-            is_wall = not (0 <= new_head[0] < config.BOARD_SIZE and 0 <= new_head[1] < config.BOARD_SIZE)
-            is_self = new_head in snake
-            if not is_wall and not is_self:
-                safe_moves.append((dr, dc))
+            if not (0 <= new_head[0] < config.BOARD_SIZE and 0 <= new_head[1] < config.BOARD_SIZE):
+                continue
+
+            if new_head in snake:
+                will_eat = (food is not None and new_head == food)
+                # Moving into the current tail is legal only if the tail will move away (i.e., not eating).
+                if not (new_head == tail and not will_eat):
+                    continue
+
+            safe_moves.append((dr, dc))
 
         return {
             "snake_head": head,
@@ -112,18 +124,24 @@ class SymbolicMemory:
         for move in state["safe_moves"]:
             new_head = (state["snake_head"][0] + move[0], state["snake_head"][1] + move[1])
 
-            # Simulate body advance (tail moves)
+            # Simulate body advance (tail moves unless we ate the food).
             from collections import deque
-            temp_snake = deque([new_head] + list(state["snake_body"])[:-1])
+            ate = (state.get("food") is not None and new_head == state.get("food"))
+            if ate:
+                temp_snake = deque([new_head] + list(state["snake_body"]))
+                next_food = None  # after eating, new food is unknown to the lookahead
+            else:
+                temp_snake = deque([new_head] + list(state["snake_body"])[:-1])
+                next_food = state.get("food")
 
-            key = self.create_state_key(temp_snake, state["food"], move)
+            key = self.create_state_key(temp_snake, next_food, move)
 
             state_data = self.memory.get(key, {})
             action_str = f"{move[0]},{move[1]}"
             if action_str in state_data.get("actions", {}):
                 scores[move] = float(state_data["actions"][action_str]["avg_reward"])
 
-            new_state = self.create_symbolic_state(temp_snake, state["food"], move)
+            new_state = self.create_symbolic_state(temp_snake, next_food, move)
             future_scores = self.recursive_reasoning(new_state, depth - 1)
 
             if future_scores:
@@ -187,7 +205,7 @@ class SymbolicMemory:
         self.memory = {k: self.memory[k] for k in sorted_keys[: config.MEMORY_MAX_ENTRIES]}
         self.is_modified = True
 
-    def _decode_payload(self, blob: bytes) -> Dict[Tuple, Dict[str, Any]]:
+    def _decode_payload(self, blob: bytes) -> tuple[Dict[Tuple, Dict[str, Any]], bool]:
         """Decode either legacy dict format or v2 payload format."""
         obj = msgpack.unpackb(
             blob,
@@ -209,7 +227,7 @@ class SymbolicMemory:
                     if not isinstance(k, tuple) or not isinstance(v, dict):
                         continue
                     mem[k] = v
-            return mem
+            return mem, False
 
         # legacy format: a dict with tuple-ish keys
         if isinstance(obj, dict):
@@ -218,7 +236,7 @@ class SymbolicMemory:
                 k = _deep_tuple(k)
                 if isinstance(k, tuple) and isinstance(v, dict):
                     mem2[k] = v
-            return mem2
+            return mem2, True
 
         raise ValueError("Unsupported memory payload type")
 
@@ -227,14 +245,15 @@ class SymbolicMemory:
         if not os.path.exists(config.MEMORY_FILE):
             logger.info("No memory file found; starting fresh")
             self.memory = {}
+            self.is_modified = False
             return
 
-        def _try_load(path: str) -> Dict[Tuple, Dict[str, Any]]:
+        def _try_load(path: str) -> tuple[Dict[Tuple, Dict[str, Any]], bool]:
             with open(path, "rb") as f:
                 return self._decode_payload(f.read())
 
         try:
-            self.memory = _try_load(config.MEMORY_FILE)
+            self.memory, legacy = _try_load(config.MEMORY_FILE)
         except Exception as e:
             logger.error("Load failed: %s", e)
 
@@ -244,7 +263,7 @@ class SymbolicMemory:
                     shutil.copy(backup_file, config.MEMORY_FILE)
                     logger.warning("Restored memory file from backup")
                     # One-shot retry only
-                    self.memory = _try_load(config.MEMORY_FILE)
+                    self.memory, legacy = _try_load(config.MEMORY_FILE)
                 except Exception as bak_e:
                     logger.error("Backup load failed: %s", bak_e)
                     # Preserve the broken file for inspection
@@ -268,12 +287,13 @@ class SymbolicMemory:
         )
         logger.info("Loaded %d states from %s", len(self.memory), config.MEMORY_FILE)
 
-        # If file was legacy (no version wrapper), migrate on next save.
-        # We keep it lightweight: mark modified so your normal save cadence rewrites it in v2.
-        self.is_modified = True
+        # Only rewrite on next save if we loaded a legacy payload.
+        self.is_modified = bool(legacy)
 
     def save_memory(self) -> None:
         """Save memory with a backup file (v2 format, atomic write)."""
+        if not config.SAVE_MEMORY:
+            return
         if not self.is_modified:
             return
 
@@ -293,20 +313,49 @@ class SymbolicMemory:
             "states": [[k, v] for k, v in self.memory.items()],
         }
 
+        blob = msgpack.packb(payload, use_bin_type=True)
         tmp_path = config.MEMORY_FILE + ".tmp"
-        try:
-            blob = msgpack.packb(payload, use_bin_type=True)
-            with open(tmp_path, "wb") as f:
+
+        def _write_blob(path: str) -> None:
+            with open(path, "wb") as f:
                 f.write(blob)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, config.MEMORY_FILE)
-            logger.info("Saved %d states to %s", len(self.memory), config.MEMORY_FILE)
-            self.is_modified = False
-        except Exception as e:
-            logger.error("Save failed: %s", e)
+
+        try:
+            _write_blob(tmp_path)
+        except Exception as exc:
+            logger.error("Failed to write temp payload: %s", exc)
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
             except Exception:
                 pass
+            return
+
+        saved = False
+        try:
+            os.replace(tmp_path, config.MEMORY_FILE)
+            saved = True
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                logger.warning("Atomic replace denied (%s); falling back to overwrite", exc)
+                try:
+                    _write_blob(config.MEMORY_FILE)
+                    saved = True
+                except Exception as fallback_exc:
+                    logger.error("Fallback write failed: %s", fallback_exc)
+            else:
+                logger.error("Save failed: %s", exc)
+        except Exception as exc:  # pragma: no cover - fallback already handled by specific cases
+            logger.error("Save failed: %s", exc)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+        if saved:
+            logger.info("Saved %d states to %s", len(self.memory), config.MEMORY_FILE)
+            self.is_modified = False

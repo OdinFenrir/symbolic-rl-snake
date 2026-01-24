@@ -36,8 +36,18 @@ def run(
     max_steps: Optional[int],
     log_jsonl: Optional[str],
     save_every: Optional[int],
+    state_dir: Optional[str],
+    no_save: bool,
 ) -> int:
     config.UI_DEBUG_MODE = bool(debug)
+    if state_dir:
+        config.set_state_dir(state_dir)
+
+    # Evaluation mode: allow loading, but disable writes.
+    if no_save:
+        config.SAVE_GAME_STATE = False
+        config.SAVE_MEMORY = False
+
     if max_steps is not None:
         config.MAX_STEPS_PER_GAME = int(max_steps)
 
@@ -173,6 +183,8 @@ def run(
         # Safety totals (optional: only if session counters exist)
         try:
             logger.info("Safety totals: rejects=%d forced=%d", session_safety_rejects, session_safety_forced)
+            if total_steps > 0:
+                logger.info("forced_rate=%.2f%%", 100.0 * session_safety_forced / float(total_steps))
         except NameError:
             pass
     return 0
@@ -182,7 +194,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
     parser = argparse.ArgumentParser(description="Snake Agent")
-    parser.add_argument("--num-games", type=int, default=10, help="Number of games to run")
+    parser.add_argument("--num-games", "--games", type=int, default=10, help="Number of games to run")
     parser.add_argument("--no-render", action="store_true", help="Disable window rendering (headless)")
     parser.add_argument("--load-state", action="store_true", help="Resume from saved state in state/game_state.json")
     parser.add_argument("--debug", action="store_true", help="Enable debug overlay (windowed mode)")
@@ -204,6 +216,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Override memory save interval (episodes). Defaults to config.MEMORY_SAVE_INTERVAL.",
     )
 
+    parser.add_argument(
+        "--state-dir",
+        type=str,
+        default=None,
+        help="Override state directory (default: state/). Useful for isolated runs.",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not write game_state or memory to disk (evaluation mode).",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Alias for --no-save (kept for convenience).",
+    )
+
     args = parser.parse_args(argv)
 
     if args.profile:
@@ -218,6 +247,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             max_steps=args.max_steps,
             log_jsonl=args.log_jsonl,
             save_every=args.save_every,
+            state_dir=args.state_dir,
+            no_save=args.no_save or args.eval,
         )
         profiler.disable()
         stats = pstats.Stats(profiler).sort_stats("cumulative")
@@ -234,4 +265,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_steps=args.max_steps,
         log_jsonl=args.log_jsonl,
         save_every=args.save_every,
+        state_dir=args.state_dir,
+        no_save=args.no_save or args.eval,
     )

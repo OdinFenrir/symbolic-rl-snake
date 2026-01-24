@@ -66,12 +66,15 @@ del state\game_state.json
 
 ## CLI options
 
-- `--num-games N` : number of games to run (default: 10)
+- `--num-games N` / `--games N` : number of games to run (default: 10)
 - `--no-render`   : headless mode
 - `--load-state`  : resume from `state/game_state.json` if present
 - `--debug`       : enable debug overlay in windowed mode
 - `--seed SEED`   : set RNG seed for reproducibility
 - `--max-steps N` : per-game safety cap (overrides config)
+- `--state-dir DIR` : override the state directory (isolated evaluations / experiments)
+- `--no-save` : do not write game_state or memory to disk (evaluation mode)
+- `--eval` : alias for `--no-save`
 
 ## Repository structure
 
