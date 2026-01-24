@@ -1,4 +1,4 @@
-"""Autonomous Snake agent."""
+﻿"""Autonomous Snake agent with trap-avoidance, anti-pocketing, and instrumentation."""
 
 from __future__ import annotations
 
@@ -14,24 +14,171 @@ from .memory import SymbolicMemory
 
 logger = logging.getLogger(__name__)
 
+Move = Tuple[int, int]
+Cell = Tuple[int, int]
+
 
 class SnakeAgent:
-    """Rule-based agent with path guidance and persistent experience memory."""
+    """Rule-based agent with path guidance and persistent experience memory.
 
-    def __init__(self) -> None:
-        self.actions = {(0, -1): "left", (0, 1): "right", (1, 0): "down", (-1, 0): "up"}
+    Key behaviors:
+    - Avoid hard traps (especially on the step you eat, when tail doesn't move).
+    - Reduce "pocketing" by preferring moves that do not increase unreachable open space.
+    - Instrumentation counters per episode: rejects/forced.
+    """
+
+    def __init__(self, seed: Optional[int] = None) -> None:
+        self.actions: Dict[Move, str] = {
+            (0, -1): "left",
+            (0, 1): "right",
+            (1, 0): "down",
+            (-1, 0): "up",
+        }
+        self.rng = random.Random(seed)
         self.symbolic_memory = SymbolicMemory()
 
-        # Metrics (useful for diagnostics)
         self.total_rsm_depth = 0
         self.decision_count = 0
 
+        # Safety tuning (local; no config churn)
+        self.escape_fail_penalty = -1e6
+
+        # Pocket policy
+        self.pocket_increase_allow_short = 2   # allow small increases early
+        self.pocket_increase_allow_long = 1    # be stricter later
+        self.long_snake_len = 16               # threshold
+        self.pocket_penalty = 3.0              # penalty per unreachable cell (pocket size)
+        self.pocket_delta_penalty = 8.0        # extra penalty per NEW unreachable cell
+        self.eat_reach_slack = 2            # require reachable >= len(snake)+slack on eat step
+
+        self._board_cells = int(config.BOARD_SIZE) * int(config.BOARD_SIZE)
+
+        # Safety instrumentation
+        self.safety_rejects = 0
+        self.safety_forced = 0
+        self._ep_safety_rejects = 0
+        self._ep_safety_forced = 0
+
+    def begin_episode(self) -> None:
+        """Reset per-episode instrumentation counters."""
+        self._ep_safety_rejects = 0
+        self._ep_safety_forced = 0
+
+    def end_episode_stats(self) -> dict:
+        """Return per-episode instrumentation stats."""
+        return {
+            "safety_rejects": int(self._ep_safety_rejects),
+            "safety_forced": int(self._ep_safety_forced),
+        }
+
+    # ----------------------------
+    # Utilities
+    # ----------------------------
+    def _in_bounds(self, cell: Cell) -> bool:
+        r, c = cell
+        return 0 <= r < config.BOARD_SIZE and 0 <= c < config.BOARD_SIZE
+
+    def _neighbors4(self, cell: Cell) -> List[Cell]:
+        r, c = cell
+        return [(r + dr, c + dc) for dr, dc in self.actions.keys()]
+
+    def _simulate_step(self, snake: Deque[Cell], move: Move, food: Optional[Cell]) -> Tuple[Deque[Cell], bool]:
+        head = snake[0]
+        new_head = (head[0] + move[0], head[1] + move[1])
+        ate = (food is not None and new_head == food)
+
+        new_snake: Deque[Cell] = deque([new_head])
+        new_snake.extend(snake)
+
+        if not ate:
+            new_snake.pop()  # tail moves only if not eating
+        return new_snake, ate
+
+    def _bfs_reachable_count(self, start: Cell, blocked: Set[Cell]) -> int:
+        if start in blocked or not self._in_bounds(start):
+            return 0
+        q = deque([start])
+        seen = {start}
+        count = 0
+        while q:
+            cur = q.popleft()
+            count += 1
+            for nxt in self._neighbors4(cur):
+                if nxt in seen or nxt in blocked or not self._in_bounds(nxt):
+                    continue
+                seen.add(nxt)
+                q.append(nxt)
+        return count
+
+    def _bfs_path_exists(self, start: Cell, goal: Cell, blocked: Set[Cell]) -> bool:
+        if start == goal:
+            return True
+        if start in blocked or not self._in_bounds(start):
+            return False
+        q = deque([start])
+        seen = {start}
+        while q:
+            cur = q.popleft()
+            for nxt in self._neighbors4(cur):
+                if not self._in_bounds(nxt) or nxt in blocked or nxt in seen:
+                    continue
+                if nxt == goal:
+                    return True
+                seen.add(nxt)
+                q.append(nxt)
+        return False
+
+    def _escape_metrics(self, snake_after: Deque[Cell], ate_food: bool) -> Tuple[int, int, bool, int]:
+        """Return (reachable, total_open, tail_reachable, pocket_size).
+
+        - If ate_food, tail did NOT move this tick -> do NOT treat tail as free.
+        - If not ate_food, we treat tail as potentially freeing space next tick (heuristic).
+        """
+        head = snake_after[0]
+        tail = snake_after[-1]
+
+        blocked = set(snake_after)
+        blocked.discard(head)  # allow BFS start
+        if not ate_food:
+            blocked.discard(tail)
+
+        reachable = self._bfs_reachable_count(head, blocked)
+        total_open = self._board_cells - len(blocked)
+
+        pocket = total_open - reachable
+        if pocket < 0:
+            pocket = 0
+
+        tail_reachable = True
+        if not ate_food:
+            tail_reachable = self._bfs_path_exists(head, tail, blocked)
+
+        return reachable, total_open, tail_reachable, pocket
+
+    def _safe_moves_with_tail_rule(self, snake: Deque[Cell], food: Optional[Cell]) -> List[Move]:
+        """Safe moves consistent with classic snake:
+        - moving into current tail cell is allowed only if we are not eating.
+        """
+        head = snake[0]
+        tail = snake[-1]
+        safe: List[Move] = []
+
+        for dr, dc in self.actions.keys():
+            nh = (head[0] + dr, head[1] + dc)
+            if not self._in_bounds(nh):
+                continue
+            if nh in snake:
+                # Tail cell is safe if it will move away this tick (i.e., not eating on that cell)
+                if not (nh == tail and (food is None or nh != food)):
+                    continue
+            safe.append((dr, dc))
+        return safe
+
+    # ----------------------------
+    # Existing scoring helpers
+    # ----------------------------
     @lru_cache(maxsize=1024)
-    def _count_reachable_space(
-        self,
-        snake_body_tuple: Tuple[Tuple[int, int], ...],
-        start_pos: Tuple[int, int],
-    ) -> int:
+    def _count_reachable_space(self, snake_body_tuple: Tuple[Cell, ...], start_pos: Cell) -> int:
         r0, c0 = start_pos
         if not (0 <= r0 < config.BOARD_SIZE and 0 <= c0 < config.BOARD_SIZE):
             return 0
@@ -40,48 +187,35 @@ class SnakeAgent:
         if start_pos in blocked:
             return 0
 
-        q: deque[Tuple[int, int]] = deque([start_pos])
+        q: deque[Cell] = deque([start_pos])
         seen = {start_pos}
         count = 0
-
         while q:
             r, c = q.popleft()
             count += 1
             for dr, dc in self.actions.keys():
                 nr, nc = r + dr, c + dc
                 nxt = (nr, nc)
-                if (
-                    0 <= nr < config.BOARD_SIZE
-                    and 0 <= nc < config.BOARD_SIZE
-                    and nxt not in blocked
-                    and nxt not in seen
-                ):
+                if 0 <= nr < config.BOARD_SIZE and 0 <= nc < config.BOARD_SIZE and nxt not in blocked and nxt not in seen:
                     seen.add(nxt)
                     q.append(nxt)
-
         return count
 
-    def _a_star_pathfinding(
-        self,
-        start: Tuple[int, int],
-        goal: Optional[Tuple[int, int]],
-        obstacles: Set[Tuple[int, int]],
-    ) -> List[Tuple[int, int]]:
+    def _a_star_pathfinding(self, start: Cell, goal: Optional[Cell], obstacles: Set[Cell]) -> List[Cell]:
         if goal is None:
             return []
 
-        def h(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+        def h(a: Cell, b: Cell) -> int:
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        open_set: List[Tuple[int, Tuple[int, int]]] = [(0, start)]
-        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
-        g_score: Dict[Tuple[int, int], int] = {start: 0}
+        open_set: List[Tuple[int, Cell]] = [(0, start)]
+        came_from: Dict[Cell, Cell] = {}
+        g_score: Dict[Cell, int] = {start: 0}
 
         while open_set:
             _, current = heapq.heappop(open_set)
-
             if current == goal:
-                path: List[Tuple[int, int]] = []
+                path: List[Cell] = []
                 while current in came_from:
                     path.append(current)
                     current = came_from[current]
@@ -89,8 +223,7 @@ class SnakeAgent:
 
             for dr, dc in self.actions.keys():
                 neighbor = (current[0] + dr, current[1] + dc)
-
-                if not (0 <= neighbor[0] < config.BOARD_SIZE and 0 <= neighbor[1] < config.BOARD_SIZE):
+                if not self._in_bounds(neighbor):
                     continue
                 if neighbor in obstacles:
                     continue
@@ -103,62 +236,240 @@ class SnakeAgent:
 
         return []
 
-    def _get_heuristic_scores(
-        self,
-        snake: Deque[Tuple[int, int]],
-        safe_moves: List[Tuple[int, int]],
-    ) -> Dict[Tuple[int, int], float]:
-        scores: Dict[Tuple[int, int], float] = {}
-        snake_body_tuple = tuple(snake)
-        tail_segments = list(snake)[-5:]
+
+    def _get_heuristic_scores(self, snake: Deque[Cell], safe_moves: List[Move], food: Optional[Cell]) -> Dict[Move, float]:
+
+
+        scores: Dict[Move, float] = {}
+
+
+        ok_map: Dict[Move, bool] = {}
+
+
+
+        # Baseline pocket size from the current position (connectivity reference)
+
+
+        _, _, _, baseline_pocket = self._escape_metrics(snake, ate_food=False)
+
+
+
+        rejected_this_step = 0
+
+
+        ok_any = False
+
+
+
+        # Treat tail as likely free for coarse space estimate
+
+
+        snake_body_tuple = tuple(list(snake)[:-1]) if len(snake) > 1 else tuple(snake)
+
+
 
         for move in safe_moves:
-            score = 0.0
+
+
             next_head = (snake[0][0] + move[0], snake[0][1] + move[1])
 
-            # Reachable space
-            space = float(self._count_reachable_space(snake_body_tuple, next_head))
-            score += space
 
-            # Dead-end detection (1 step ahead)
+
+            # Coarse open space score
+
+
+            coarse_space = float(self._count_reachable_space(snake_body_tuple, next_head))
+
+
+            score = coarse_space
+
+
+
+            # Simulate and evaluate topology
+
+
+            sim_snake, ate = self._simulate_step(snake, move, food)
+
+
+            reachable, _total_open, tail_ok, pocket = self._escape_metrics(sim_snake, ate_food=ate)
+
+
+
+            pocket_delta_raw = pocket - baseline_pocket
+
+
+
+            # Safety gate:
+
+
+            # - Eating is high risk: require tail reachability AND sufficient reachable space.
+
+
+            # - Non-eat moves: allow temporary disconnection if the head component remains comfortably large,
+
+
+            #   but avoid creating large new pockets while disconnected.
+
+
+            if ate:
+
+
+                ok = bool(tail_ok) and (reachable >= (len(sim_snake) + int(self.eat_reach_slack)))
+
+
+            else:
+
+
+                ok = bool(tail_ok) or (reachable >= (len(sim_snake) + 2))
+
+
+                if (not tail_ok) and (pocket_delta_raw >= 6):
+
+
+                    ok = False
+
+
+
+            ok_map[move] = ok
+
+
+            if not ok:
+
+
+                rejected_this_step += 1
+
+
+            else:
+
+
+                ok_any = True
+
+
+
+            # SOFT pocket control:
+
+
+            pocket_delta = pocket_delta_raw
+
+
+            if pocket_delta < 0:
+
+
+                # reward "healing" pockets
+
+
+                score += 2.0 * float(-pocket_delta)
+
+
+                pocket_delta = 0
+
+
+
+            score -= self.pocket_penalty * float(pocket)
+
+
+            score -= self.pocket_delta_penalty * float(pocket_delta) * (2.0 if ate else 1.0)
+
+
+
+            if ok and pocket == 0:
+
+
+                score += 2.0
+
+
+
+            # Avoid low-degree positions (future mobility)
+
+
             temp_snake = deque([next_head])
+
+
             temp_snake.extend(list(snake)[:-1])
+
+
             future_safe = 0
+
+
             for dr, dc in self.actions.keys():
-                future_head = (next_head[0] + dr, next_head[1] + dc)
-                if (
-                    0 <= future_head[0] < config.BOARD_SIZE
-                    and 0 <= future_head[1] < config.BOARD_SIZE
-                    and future_head not in temp_snake
-                ):
+
+
+                fh = (next_head[0] + dr, next_head[1] + dc)
+
+
+                if self._in_bounds(fh) and fh not in temp_snake:
+
+
                     future_safe += 1
+
+
             if future_safe <= 1:
+
+
                 score *= 0.1
 
-            # Tail proximity (discourage squeezing into tight spaces)
-            min_dist_to_tail = min(
-                (abs(next_head[0] - sx) + abs(next_head[1] - sy) for sx, sy in tail_segments),
-                default=100,
-            )
-            if min_dist_to_tail <= 2 and space < len(snake) * 2:
-                score += config.PENALTY_TAIL_PROXIMITY
+
 
             scores[move] = score
+
+
+
+        # Only hard-penalize unsafe moves if there exists at least one OK alternative.
+
+
+        # If everything is unsafe, keep relative ordering so we pick the least-bad move.
+
+
+        if ok_any:
+
+
+            for mv, ok in ok_map.items():
+
+
+                if not ok:
+
+
+                    scores[mv] += self.escape_fail_penalty
+
+
+
+        # Instrumentation aggregation (per decision)
+
+
+        if rejected_this_step:
+
+
+            self._ep_safety_rejects += rejected_this_step
+
+
+            self.safety_rejects += rejected_this_step
+
+
+        if not ok_any:
+
+
+            self._ep_safety_forced += 1
+
+
+            self.safety_forced += 1
+
+
 
         return scores
 
     def _combine_scores(
         self,
-        heuristic_scores: Dict[Tuple[int, int], float],
-        rsm_scores: Dict[Tuple[int, int], float],
-        a_star_path: List[Tuple[int, int]],
-        safe_moves: List[Tuple[int, int]],
-        snake_head: Tuple[int, int],
-    ) -> Tuple[Tuple[int, int], Dict[Tuple[int, int], float]]:
-        final_scores: Dict[Tuple[int, int], float] = {}
-        max_h = max(heuristic_scores.values()) if heuristic_scores else 1.0
+        heuristic_scores: Dict[Move, float],
+        rsm_scores: Dict[Move, float],
+        a_star_path: List[Cell],
+        safe_moves: List[Move],
+        snake_head: Cell,
+    ) -> Tuple[Move, Dict[Move, float]]:
+        final_scores: Dict[Move, float] = {}
 
-        a_star_move = None
+        max_h = max(heuristic_scores.values()) if heuristic_scores else 1.0
+        a_star_move: Optional[Move] = None
+
         if a_star_path:
             dr = a_star_path[0][0] - snake_head[0]
             dc = a_star_path[0][1] - snake_head[1]
@@ -171,36 +482,42 @@ class SnakeAgent:
             bonus = config.A_STAR_BONUS if (a_star_move and move == a_star_move) else 0.0
             final_scores[move] = h_score + r_score + bonus
 
-        best = max(final_scores, key=final_scores.get)
+        best_score = max(final_scores.values())
+        best_moves = [m for m, s in final_scores.items() if s == best_score]
+        best = self.rng.choice(best_moves)
         return best, final_scores
 
-    def choose_action(
-        self,
-        snake: Deque[Tuple[int, int]],
-        food: Optional[Tuple[int, int]],
-        direction: Tuple[int, int],
-    ) -> Tuple[Tuple[int, int], Dict[str, Any]]:
+    # ----------------------------
+    # Main decision
+    # ----------------------------
+    def choose_action(self, snake: Deque[Cell], food: Optional[Cell], direction: Move) -> Tuple[Move, Dict[str, Any]]:
         self.decision_count += 1
-        pre_state = self.symbolic_memory.create_symbolic_state(snake, food, direction)
-        safe_moves: List[Tuple[int, int]] = pre_state["safe_moves"]
-        debug_info: Dict[str, Any] = {}
 
+        # Use tail-rule safe moves (more accurate than "new_head in snake" checks).
+        safe_moves = self._safe_moves_with_tail_rule(snake, food)
+
+        # Build symbolic state for memory/RSM, but override safe_moves to match our real rule.
+        pre_state = self.symbolic_memory.create_symbolic_state(snake, food, direction)
+        pre_state["safe_moves"] = safe_moves
+
+        debug_info: Dict[str, Any] = {}
         if not safe_moves:
-            return random.choice(list(self.actions.keys())), debug_info
+            return self.rng.choice(list(self.actions.keys())), debug_info
         if len(safe_moves) == 1:
             return safe_moves[0], debug_info
 
-        heuristic_scores = self._get_heuristic_scores(snake, safe_moves)
+        heuristic_scores = self._get_heuristic_scores(snake, safe_moves, food)
 
         rsm_depth = max(config.RSM_MIN_DEPTH, min(config.RSM_MAX_DEPTH, len(snake) // 4))
         self.total_rsm_depth += rsm_depth
         rsm_scores = self.symbolic_memory.recursive_reasoning(pre_state, depth=rsm_depth)
 
-        a_star_path = self._a_star_pathfinding(snake[0], food, set(snake))
+        obstacles = set(snake)
+        if len(snake) > 1:
+            obstacles.discard(snake[-1])  # allow routes through moving tail (planning heuristic)
+        a_star_path = self._a_star_pathfinding(snake[0], food, obstacles)
         debug_info["a_star_path"] = a_star_path
 
-        best, final_scores = self._combine_scores(
-            heuristic_scores, rsm_scores, a_star_path, safe_moves, snake[0]
-        )
+        best, final_scores = self._combine_scores(heuristic_scores, rsm_scores, a_star_path, safe_moves, snake[0])
         debug_info["final_scores"] = final_scores
         return best, debug_info
