@@ -85,6 +85,27 @@ The options screen exposes a “Toggle tuning metrics” entry that reveals the 
 
 `--log-jsonl PATH` now records extra columns per episode: `forced_rate`, `safety_rejects`, `safety_forced`, `tuner_safety`, `tuner_reward`, `memory_size`, and `won`. These give you actionable benchmarking data without rendering and let you track how the adaptive tuner drifts.
 
+## Performance tuning
+
+- **Higher life budget:** Both `INITIAL_LIFE` and `MAX_LIFE` are 1000, so the snake has a much larger safety buffer before starvation penalties kick in.
+- **Age-aware heuristics:** The same `segment_ages` vector that drives the live gradient now biases move scoring toward younger segments and longer corridors, and the adaptive tuner targets a 3% forced rate so it accepts more aggressive paths without sacrificing safety.
+- **Reward shaping refinements:** Distance shaping caps per-step reward (`MAX_DISTANCE_REWARD_DELTA`) and food reward now grows with a 💥 power term (`FOOD_REWARD_POWER`), so longer snakes earn progressively more for each apple.
+- **Repeatable benchmarks:** Train and evaluate with JSONL telemetry to compare patches:
+
+  ```bash
+  python -m snake --no-render --num-games 300 --state-dir state/train --seed 42 --log-jsonl runs/train_seed42.jsonl
+  python -m snake --no-render --num-games 100 --seed 42 --state-dir state/train --eval --log-jsonl runs/eval_seed42.jsonl
+```
+
+Analyze either file with your pandas command to compare `score`, `forced_rate`, `tuner_safety`, `tuner_reward`, and `memory_size`.
+
+You can automate both runs plus the pandas summary using the helper script:
+```
+python scripts/run_benchmark.py --seed 42 --train-games 300 --eval-games 100
+```
+
+The script writes its logs under `runs/` and prints the descriptive statistics for both training and evaluation JSONL files.
+
 ## Visual + planning parity
 
 The renderer now draws the snake with a teal-to-navy body gradient whose ratio to the head/tail colors is shared with the agent. Each decision exposes a `segment_ages` vector (head=0, tail=1) in the symbolic state so `SymbolicMemory` can distinguish freshly traveled paths from aging tails, and the same age data drives the live metrics overlay and menu palette. This keeps rendering and planning in sync, making it obvious where the agent is relying on “young” segments versus “stale” ones when escaping pockets.

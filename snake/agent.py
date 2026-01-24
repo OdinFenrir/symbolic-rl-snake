@@ -102,11 +102,11 @@ class SnakeAgent:
         self.escape_fail_penalty = -1e6
 
         # Pocket policy
-        self.pocket_increase_allow_short = 2   # allow small increases early
-        self.pocket_increase_allow_long = 1    # be stricter later
+        self.pocket_increase_allow_short = 3   # allow small increases early
+        self.pocket_increase_allow_long = 2    # be stricter later
         self.long_snake_len = 16               # threshold
-        self.pocket_penalty = 3.0              # penalty per unreachable cell (pocket size)
-        self.pocket_delta_penalty = 8.0        # extra penalty per NEW unreachable cell
+        self.pocket_penalty = 2.1              # penalty per unreachable cell (pocket size)
+        self.pocket_delta_penalty = 5.5        # extra penalty per NEW unreachable cell
         self.eat_reach_slack = 2            # require reachable >= len(snake)+slack on eat step
 
         self._board_cells = int(config.BOARD_SIZE) * int(config.BOARD_SIZE)
@@ -269,6 +269,17 @@ class SnakeAgent:
         if min(gap_a, gap_b) < config.EDGE_GAP_THRESHOLD:
             return config.EDGE_GAP_PENALTY
         return 0.0
+
+    def _young_segment_bonus(self, next_head: Cell, age_map: Dict[Cell, float]) -> float:
+        """Reward moves that stay near young (low-age) segments."""
+        bonus = 0.0
+        for dr, dc in self.actions.keys():
+            candidate = (next_head[0] + dr, next_head[1] + dc)
+            age = age_map.get(candidate)
+            if age is None:
+                continue
+            bonus += max(0.0, 1.0 - float(age))
+        return bonus
     def _safe_moves_with_tail_rule(
         self, snake: Deque[Cell], food: Optional[Cell], direction: Move
     ) -> List[Move]:
@@ -342,6 +353,7 @@ class SnakeAgent:
         safe_moves: List[Move],
         food: Optional[Cell],
         life: Optional[float],
+        segment_ages: Tuple[float, ...],
     ) -> Tuple[Dict[Move, float], Dict[Move, Dict[str, float]]]:
         center_coord = float(config.BOARD_SIZE - 1) / 2.0
         max_center_distance = float(2 * (config.BOARD_SIZE // 2))
@@ -357,6 +369,7 @@ class SnakeAgent:
 
         # Treat tail as likely free for coarse space estimate.
         snake_body_tuple = tuple(list(snake)[:-1]) if len(snake) > 1 else tuple(snake)
+        age_map: Dict[Cell, float] = {cell: age for cell, age in zip(snake, segment_ages)}
 
         # Allow small pocket increases early; be stricter later.
         allow = self.pocket_increase_allow_long if len(snake) >= self.long_snake_len else self.pocket_increase_allow_short
@@ -382,6 +395,9 @@ class SnakeAgent:
             # Coarse open space score.
             coarse_space = float(self._count_reachable_space(snake_body_tuple, next_head))
             score = coarse_space * reward_scale
+
+            age_bonus = self._young_segment_bonus(next_head, age_map)
+            score += age_bonus * float(config.AGE_PROXIMITY_WEIGHT)
 
             # Gentle urgency-to-food shaping when life is low.
             if food is not None and urgency > 0.0:
@@ -581,7 +597,7 @@ class SnakeAgent:
         if len(safe_moves) == 1:
             return safe_moves[0], debug_info
 
-        heuristic_scores, heuristic_meta = self._get_heuristic_scores(snake, safe_moves, food, life)
+        heuristic_scores, heuristic_meta = self._get_heuristic_scores(snake, safe_moves, food, life, segment_ages)
 
         rsm_depth = max(config.RSM_MIN_DEPTH, min(config.RSM_MAX_DEPTH, len(snake) // 4))
         self.total_rsm_depth += rsm_depth

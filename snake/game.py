@@ -169,7 +169,11 @@ class SnakeGame:
         reward = 0.0
 
         if ate_food:
-            reward += config.REWARD_FOOD + (len(self.snake) * config.FOOD_REWARD_LENGTH_MULTIPLIER)
+            reward += config.REWARD_FOOD
+            reward += (
+                (len(self.snake) ** config.FOOD_REWARD_POWER)
+                * config.FOOD_REWARD_LENGTH_MULTIPLIER
+            )
 
         # Distance shaping should reference the pre-move food position (not newly spawned food).
         pre_food = pre_move_state.get("food")
@@ -177,7 +181,10 @@ class SnakeGame:
             old_head = pre_move_state.get("snake_head", self.snake[0])
             old_dist = abs(old_head[0] - pre_food[0]) + abs(old_head[1] - pre_food[1])
             new_dist = abs(new_head[0] - pre_food[0]) + abs(new_head[1] - pre_food[1])
-            reward += (old_dist - new_dist) * config.DISTANCE_REWARD_SCALAR
+            delta = old_dist - new_dist
+            if delta > 0:
+                delta = min(delta, config.MAX_DISTANCE_REWARD_DELTA)
+            reward += delta * config.DISTANCE_REWARD_SCALAR
 
         action_str = f"{self.direction[0]},{self.direction[1]}"
         self.consecutive_moves[action_str] += 1

@@ -213,6 +213,7 @@ def run(
                         "safety_forced": int(stats.get("safety_forced", 0)),
                         "tuner_safety": tuning_metrics["safety_bias"],
                         "tuner_reward": tuning_metrics["reward_bias"],
+                        "tuner_best": tuning_metrics.get("best_score", 0.0),
                         "memory_size": len(agent.symbolic_memory.memory),
                         "won": bool(game.won),
                     }
