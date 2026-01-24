@@ -8,9 +8,10 @@ import math
 import random
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Optional, Set, Tuple
 
 from . import config
+from .rules import legal_moves, is_legal_move, Move
 
 logger = logging.getLogger(__name__)
 
@@ -93,20 +94,8 @@ class SnakeGame:
 
         r, c = new_head
 
-        if not (0 <= r < config.BOARD_SIZE and 0 <= c < config.BOARD_SIZE):
-
-            return True
-
-
-        # Collision with body. Moving into the current tail is legal if tail moves away (not eating).
-
-        body = list(self.snake)[1:]
-
-        if (not will_eat) and len(body) > 0:
-
-            body = body[:-1]
-
-        return new_head in body
+        move = (new_head[0] - self.snake[0][0], new_head[1] - self.snake[0][1])
+        return not is_legal_move(self.snake, self.food, move, self.direction)
 
     def _update_snake(self, action: Tuple[int, int]) -> Tuple[Tuple[int, int], bool]:
 

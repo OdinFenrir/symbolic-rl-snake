@@ -13,13 +13,14 @@ import logging
 import os
 import shutil
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Optional, Tuple, Iterable
 
 import errno
 import msgpack
 
 from . import config
+from .rules import legal_moves
 
 logger = logging.getLogger(__name__)
 
@@ -91,20 +92,7 @@ class SymbolicMemory:
             else float("inf")
         )
 
-        safe_moves = []
-        tail = snake[-1]
-        for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-            new_head = (head[0] + dr, head[1] + dc)
-            if not (0 <= new_head[0] < config.BOARD_SIZE and 0 <= new_head[1] < config.BOARD_SIZE):
-                continue
-
-            if new_head in snake:
-                will_eat = (food is not None and new_head == food)
-                # Moving into the current tail is legal only if the tail will move away (i.e., not eating).
-                if not (new_head == tail and not will_eat):
-                    continue
-
-            safe_moves.append((dr, dc))
+        safe_moves = legal_moves(snake, food, direction, forbid_reverse=True)
 
         return {
             "snake_head": head,
@@ -125,7 +113,6 @@ class SymbolicMemory:
             new_head = (state["snake_head"][0] + move[0], state["snake_head"][1] + move[1])
 
             # Simulate body advance (tail moves unless we ate the food).
-            from collections import deque
             ate = (state.get("food") is not None and new_head == state.get("food"))
             if ate:
                 temp_snake = deque([new_head] + list(state["snake_body"]))

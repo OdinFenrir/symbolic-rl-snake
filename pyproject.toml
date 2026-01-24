@@ -18,3 +18,7 @@ snake-agent = "snake.__main__:main"
 
 [tool.setuptools]
 packages = ["snake"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["snake-*", "tmp-*", ".pytest_cache"]

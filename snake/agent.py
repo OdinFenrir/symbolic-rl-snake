@@ -11,6 +11,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from . import config
 from .memory import SymbolicMemory
+from .rules import legal_moves
 
 logger = logging.getLogger(__name__)
 
@@ -130,10 +131,6 @@ class SnakeAgent:
         self._recent_heads.clear()
         self._recent_moves.clear()
 
-        # Short-term loop breaking (local-only; resets each episode)
-        self._recent_heads: Deque[Cell] = deque(maxlen=32)
-        self._recent_moves: Deque[Move] = deque(maxlen=16)
-
     def end_episode_stats(self) -> dict:
         """Return per-episode instrumentation stats."""
         return {
@@ -239,24 +236,10 @@ class SnakeAgent:
 
         return reachable, total_open, tail_reachable, pocket
 
-    def _safe_moves_with_tail_rule(self, snake: Deque[Cell], food: Optional[Cell]) -> List[Move]:
-        """Safe moves consistent with classic snake:
-        - moving into current tail cell is allowed only if we are not eating.
-        """
-        head = snake[0]
-        tail = snake[-1]
-        safe: List[Move] = []
-
-        for dr, dc in self.actions.keys():
-            nh = (head[0] + dr, head[1] + dc)
-            if not self._in_bounds(nh):
-                continue
-            if nh in snake:
-                # Tail cell is safe if it will move away this tick (i.e., not eating on that cell)
-                if not (nh == tail and (food is None or nh != food)):
-                    continue
-            safe.append((dr, dc))
-        return safe
+    def _safe_moves_with_tail_rule(
+        self, snake: Deque[Cell], food: Optional[Cell], direction: Move
+    ) -> List[Move]:
+        return legal_moves(snake, food, direction, forbid_reverse=True)
 
     # ----------------------------
     # Existing scoring helpers
@@ -412,8 +395,7 @@ class SnakeAgent:
                 score += 2.0
 
             # Avoid low-degree positions (future mobility).
-            temp_snake = deque([next_head])
-            temp_snake.extend(list(snake)[:-1])
+            temp_snake = deque(sim_snake)
             future_safe = 0
             for dr, dc in self.actions.keys():
                 fh = (next_head[0] + dr, next_head[1] + dc)
@@ -517,7 +499,7 @@ class SnakeAgent:
         self.decision_count += 1
 
         # Use tail-rule safe moves (more accurate than "new_head in snake" checks).
-        safe_moves = self._safe_moves_with_tail_rule(snake, food)
+        safe_moves = self._safe_moves_with_tail_rule(snake, food, direction)
 
         # Track recent head positions for loop-breaking (soft).
         if not self._recent_heads or self._recent_heads[0] != snake[0]:

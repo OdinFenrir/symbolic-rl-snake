@@ -72,8 +72,21 @@ Windowed runs now support an Esc-driven menu. Press Esc to pause, navigate with 
 
 ## Testing & automation
 
-- python -m pytest tests/test_smoke.py ensures the CLI loop runs headless without crashing (GitHub Actions runs this on every push).
-- The GitHub Actions workflow (.github/workflows/ci.yml) runs the headless smoke test plus linting.
+- `python -m pytest` now exercises the full `tests/` suite (headless smoke run plus the new tail-rule safety test, memory roundtrip coverage, and deterministic-score regression).
+- `python -m unittest discover -s tests -p "test_*.py" -v` mirrors the GitHub Actions smoke test entry to catch regressions in the CLI/train loop.
+- The GitHub Actions workflow (.github/workflows/ci.yml) still runs the headless smoke test, ensuring that CI matches local usage.
+
+## Key project files
+
+- `main.py` / `snake/__main__.py`: package entry point that forwards to `snake.cli.main`.
+- `snake/cli.py`: orchestrates rendering vs. headless runs, adapts `config`, and manages persistence/no-save evaluation.
+- `snake/game.py`: engine rules, reward shaping, rendering, and the ESC-driven menu that can wipe memory/state.
+- `snake/agent.py`: agent heuristics, safety filters, A* guidance, loop-breaking penalties, and the adaptive tuner.
+- `snake/memory.py`: versioned symbolic memory, msgpack persistence, legacy migration, and pruning hooks.
+- `snake/config.py`: central defaults, `STATE_DIR` derivation, and validation logic for rewards/penalties.
+- `pyproject.toml` + `requirements.txt`: packaging metadata (including the new pytest ignore list) and runtime dependencies.
+- `tests/`: unit/behavioral tests (smoke, tail rule, memory, determinism) that guard safety and determinism guarantees.
+- `state/`: runtime persistence (symbolic memory + saved boards); keep it around for analysis, but wipe via `scripts/` or the in-game menu when needed.
 
 ## Repository structure
 
