@@ -61,6 +61,9 @@ Use --load-state or python main.py --load-state to resume, or delete those files
 | --max-steps N | Per-game safety cap (overrides config) |
 | --state-dir DIR | Override the state directory (isolated runs) |
 | --no-save / --eval | Skip writing game or memory state (evaluation mode) |
+| --reset-memory | Delete persisted symbolic memory before running |
+| --reset-state | Delete saved game state before running |
+| --reset-all | Delete both memory and saved game state before running |
 
 ## Adaptive tuning
 
@@ -70,11 +73,21 @@ The agent monitors forced / reject counts and keeps a short history of forced ra
 
 Windowed runs now support an Esc-driven menu. Press Esc to pause, navigate with the up/down arrow keys and Enter, clear state/symbolic_memory.msgpack or state/game_state.json, or quit cleanly. The menu synchronizes with the CLI so memory clears happen before the next game starts.
 
+The options screen exposes a “Toggle tuning metrics” entry that reveals the adaptive tuner’s current `safety_bias`, `reward_bias`, and best score in the menu overlay and briefly flashes them after every memory save. Press `M` during play to open the extended live metrics panel (left side) and keep watching the heuristics, final-score distribution, life, and tuner biases in real time without opening the menu.
+
 ## Testing & automation
 
-- `python -m pytest` now exercises the full `tests/` suite (headless smoke run plus the new tail-rule safety test, memory roundtrip coverage, and deterministic-score regression).
-- `python -m unittest discover -s tests -p "test_*.py" -v` mirrors the GitHub Actions smoke test entry to catch regressions in the CLI/train loop.
-- The GitHub Actions workflow (.github/workflows/ci.yml) still runs the headless smoke test, ensuring that CI matches local usage.
+- `python -m pytest` now exercises the full suite (smoke + determinism + memory/tail-rule coverage) before each push.
+- `python -m unittest discover -s tests -p "test_*.py" -v` mirrors the GitHub Actions smoke test entry so CLI regressions stay visible.
+- The GitHub Actions workflow runs the headless smoke test and captures JSONL telemetry for easier correlation with forced rate and tuner bias trends.
+
+## Logging & telemetry
+
+`--log-jsonl PATH` now records extra columns per episode: `forced_rate`, `safety_rejects`, `safety_forced`, `tuner_safety`, `tuner_reward`, `memory_size`, and `won`. These give you actionable benchmarking data without rendering and let you track how the adaptive tuner drifts.
+
+## Visual + planning parity
+
+The renderer now draws the snake with a teal-to-navy body gradient whose ratio to the head/tail colors is shared with the agent. Each decision exposes a `segment_ages` vector (head=0, tail=1) in the symbolic state so `SymbolicMemory` can distinguish freshly traveled paths from aging tails, and the same age data drives the live metrics overlay and menu palette. This keeps rendering and planning in sync, making it obvious where the agent is relying on “young” segments versus “stale” ones when escaping pockets.
 
 ## Key project files
 

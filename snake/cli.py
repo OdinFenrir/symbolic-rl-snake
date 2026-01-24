@@ -27,6 +27,27 @@ def _open_jsonl(path: Optional[str]):
     return p.open("a", encoding="utf-8")
 
 
+def _clear_path(path_str: str) -> bool:
+    path = Path(path_str)
+    if not path.exists():
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError as exc:
+        logger.warning("Unable to delete %s: %s", path, exc)
+        return False
+
+
+def _reset_memory_files():
+    for suffix in ("", ".bak", ".tmp"):
+        _clear_path(config.MEMORY_FILE + suffix)
+
+
+def _reset_state_files():
+    _clear_path(config.GAME_STATE_FILE)
+
+
 def run(
     num_games: int,
     render: bool,
@@ -38,6 +59,9 @@ def run(
     save_every: Optional[int],
     state_dir: Optional[str],
     no_save: bool,
+    reset_memory: bool = False,
+    reset_state: bool = False,
+    reset_all: bool = False,
 ) -> int:
     config.UI_DEBUG_MODE = bool(debug)
     config_snapshot = {
@@ -50,6 +74,17 @@ def run(
     }
     if state_dir:
         config.set_state_dir(state_dir)
+
+    if reset_all:
+        reset_memory = True
+        reset_state = True
+
+    if reset_memory:
+        _reset_memory_files()
+        logger.info("Memory reset via CLI")
+    if reset_state:
+        _reset_state_files()
+        logger.info("Game state reset via CLI")
 
     # Evaluation mode: allow loading, but disable writes.
     if no_save:
@@ -121,6 +156,7 @@ def run(
                     game.snake, game.food, game.direction
                 )
                 action, debug_info = agent.choose_action(game.snake, game.food, game.direction, game.life)
+                game.update_live_metrics(debug_info.get("metrics", {}))
 
                 reward = game.move_snake(action, pre_move_state)
                 agent.symbolic_memory.update_memory(pre_move_state, action, reward)
@@ -148,6 +184,8 @@ def run(
             stats = agent.record_episode_stats(game.score, steps_this_game)
             session_safety_rejects += int(stats.get('safety_rejects', 0))
             session_safety_forced += int(stats.get('safety_forced', 0))
+            tuning_metrics = agent.tuner_metrics()
+            game.set_metrics_info(tuning_metrics)
             logger.info(
                 "Game %d/%d: Score=%d Steps=%d (%.2fs) | safety rejects=%d forced=%d",
                 i + 1,
@@ -168,14 +206,27 @@ def run(
                     "render": bool(render),
                     "board": int(config.BOARD_SIZE),
                 }
+                row.update(
+                    {
+                        "forced_rate": float(stats.get("forced_rate", 0.0)),
+                        "safety_rejects": int(stats.get("safety_rejects", 0)),
+                        "safety_forced": int(stats.get("safety_forced", 0)),
+                        "tuner_safety": tuning_metrics["safety_bias"],
+                        "tuner_reward": tuning_metrics["reward_bias"],
+                        "memory_size": len(agent.symbolic_memory.memory),
+                        "won": bool(game.won),
+                    }
+                )
                 jsonl_f.write(json.dumps(row) + "\n")
                 jsonl_f.flush()
 
             if save_interval > 0 and ((i + 1) % save_interval == 0):
                 agent.symbolic_memory.save_memory()
+                game.show_metrics_overlay(tuning_metrics)
 
         game.save_game_state()
         agent.symbolic_memory.save_memory()
+        game.show_metrics_overlay(agent.tuner_metrics())
         if jsonl_f is not None:
             jsonl_f.close()
 
@@ -241,6 +292,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Override state directory (default: state/). Useful for isolated runs.",
     )
     parser.add_argument(
+        "--reset-memory",
+        action="store_true",
+        help="Delete persisted symbolic memory (state/symbolic_memory.msgpack) before running.",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Delete saved game state (state/game_state.json) before running.",
+    )
+    parser.add_argument(
+        "--reset-all",
+        action="store_true",
+        help="Delete both memory and saved game state before running.",
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="Do not write game_state or memory to disk (evaluation mode).",
@@ -267,6 +333,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             save_every=args.save_every,
             state_dir=args.state_dir,
             no_save=args.no_save or args.eval,
+            reset_memory=args.reset_memory,
+            reset_state=args.reset_state,
+            reset_all=args.reset_all,
         )
         profiler.disable()
         stats = pstats.Stats(profiler).sort_stats("cumulative")
@@ -285,4 +354,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         save_every=args.save_every,
         state_dir=args.state_dir,
         no_save=args.no_save or args.eval,
+        reset_memory=args.reset_memory,
+        reset_state=args.reset_state,
+        reset_all=args.reset_all,
     )

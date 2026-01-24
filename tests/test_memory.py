@@ -55,3 +55,29 @@ class MemoryPersistenceTest(unittest.TestCase):
 
         reloaded = SymbolicMemory()
         self.assertTrue(reloaded.is_modified)
+
+
+class MemoryPruneTest(unittest.TestCase):
+    def setUp(self):
+        self.orig_max = config.MEMORY_MAX_ENTRIES
+        self.orig_recency = config.MEMORY_RECENCY_WEIGHT
+        config.MEMORY_MAX_ENTRIES = 2
+        config.MEMORY_RECENCY_WEIGHT = 0.002
+
+    def tearDown(self):
+        config.MEMORY_MAX_ENTRIES = self.orig_max
+        config.MEMORY_RECENCY_WEIGHT = self.orig_recency
+
+    def test_prune_memory_trims_entries(self):
+        memory = SymbolicMemory()
+        memory.memory = {
+            ((i,),): {
+                "visits": i + 1,
+                "last_visit_step": memory.total_updates - i,
+                "actions": {},
+            }
+            for i in range(5)
+        }
+        memory.total_updates = 100
+        memory.prune_memory()
+        self.assertLessEqual(len(memory.memory), config.MEMORY_MAX_ENTRIES)

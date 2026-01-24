@@ -12,6 +12,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from . import config
 from .memory import SymbolicMemory
 from .rules import legal_moves
+from .utils import segment_age_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,38 @@ class SnakeAgent:
 
         return reachable, total_open, tail_reachable, pocket
 
+    def _wall_distance(self, cell: Cell) -> int:
+        r, c = cell
+        return min(r, c, config.BOARD_SIZE - 1 - r, config.BOARD_SIZE - 1 - c)
+
+    def _perpendicular_gap(self, start: Cell, direction: Move, blocked: Set[Cell]) -> int:
+        dr, dc = direction
+        gap = 0
+        r, c = start
+        while True:
+            r += dr
+            c += dc
+            nxt = (r, c)
+            if not self._in_bounds(nxt) or nxt in blocked:
+                break
+            gap += 1
+            if gap >= config.EDGE_GAP_THRESHOLD:
+                break
+        return gap
+
+    def _edge_gap_penalty(self, next_head: Cell, move: Move, blocked: Set[Cell], snake_len: int) -> float:
+        if snake_len < config.EDGE_GAP_MIN_LENGTH:
+            return 0.0
+        if self._wall_distance(next_head) > config.EDGE_PROXIMITY:
+            return 0.0
+
+        perp_a = (move[1], -move[0])
+        perp_b = (-move[1], move[0])
+        gap_a = self._perpendicular_gap(next_head, perp_a, blocked)
+        gap_b = self._perpendicular_gap(next_head, perp_b, blocked)
+        if min(gap_a, gap_b) < config.EDGE_GAP_THRESHOLD:
+            return config.EDGE_GAP_PENALTY
+        return 0.0
     def _safe_moves_with_tail_rule(
         self, snake: Deque[Cell], food: Optional[Cell], direction: Move
     ) -> List[Move]:
@@ -309,8 +342,11 @@ class SnakeAgent:
         safe_moves: List[Move],
         food: Optional[Cell],
         life: Optional[float],
-    ) -> Dict[Move, float]:
+    ) -> Tuple[Dict[Move, float], Dict[Move, Dict[str, float]]]:
+        center_coord = float(config.BOARD_SIZE - 1) / 2.0
+        max_center_distance = float(2 * (config.BOARD_SIZE // 2))
         scores: Dict[Move, float] = {}
+        meta: Dict[Move, Dict[str, float]] = {}
         ok_map: Dict[Move, bool] = {}
 
         # Baseline pocket size from the current position (connectivity reference).
@@ -402,7 +438,28 @@ class SnakeAgent:
                 if self._in_bounds(fh) and fh not in temp_snake:
                     future_safe += 1
             if future_safe <= 1:
-                score *= 0.1
+                score -= config.TRAP_PENALTY
+
+            if max_center_distance > 0 and len(snake) < config.CENTER_BIAS_MAX_LENGTH:
+                center_distance = abs(next_head[0] - center_coord) + abs(next_head[1] - center_coord)
+                proximity = 1.0 - min(1.0, center_distance / max_center_distance)
+                food_far = base_food_dist >= config.CENTER_BIAS_MIN_DISTANCE if food is not None else True
+                if food_far:
+                    center_bonus = proximity * config.CENTER_BIAS_WEIGHT
+                    score += center_bonus
+
+            blocked_next = set(sim_snake)
+            score += self._edge_gap_penalty(next_head, move, blocked_next, len(sim_snake))
+
+            meta[move] = {
+                "reachable": float(reachable),
+                "pocket": float(pocket),
+                "pocket_delta": float(pocket_delta_raw),
+                "tail_ok": 1.0 if tail_ok else 0.0,
+                "future_safe": float(future_safe),
+                "coarse_space": coarse_space,
+                "ok": 1.0 if ok else 0.0,
+            }
 
             scores[move] = score
 
@@ -421,7 +478,7 @@ class SnakeAgent:
             self._ep_safety_forced += 1
             self.safety_forced += 1
 
-        return scores
+        return scores, meta
 
     def _cycle_penalty(self, move: Move, snake_head: Cell, direction: Move, life: Optional[float]) -> float:
         """Soft penalty to discourage tight cycles / oscillations.
@@ -456,6 +513,7 @@ class SnakeAgent:
     def _combine_scores(
         self,
         heuristic_scores: Dict[Move, float],
+        heuristic_meta: Dict[Move, Dict[str, float]],
         rsm_scores: Dict[Move, float],
         a_star_path: List[Cell],
         safe_moves: List[Move],
@@ -480,11 +538,17 @@ class SnakeAgent:
             if denom > 1e-9:
                 h_norm = (h_raw - float(h_min)) / float(denom)
             else:
-                h_norm = 0.0
+                h_norm = 0.5
             h_score = h_norm * float(config.HEURISTIC_WEIGHT)
 
             r_score = float(rsm_scores.get(move, 0.0)) * float(config.RSM_WEIGHT)
             bonus = float(config.A_STAR_BONUS) * h_norm if (a_star_move and move == a_star_move) else 0.0
+            if (
+                a_star_move
+                and move == a_star_move
+                and heuristic_meta.get(move, {}).get("ok", 0.0) > 0
+            ):
+                bonus += float(config.SAFE_PATH_BONUS)
             final_scores[move] = h_score + r_score + bonus
 
         best_score = max(final_scores.values())
@@ -506,7 +570,9 @@ class SnakeAgent:
             self._recent_heads.appendleft(snake[0])
 
         # Build symbolic state for memory/RSM, but override safe_moves to match our real rule.
+        segment_ages = segment_age_sequence(snake)
         pre_state = self.symbolic_memory.create_symbolic_state(snake, food, direction)
+        pre_state["segment_ages"] = segment_ages
         pre_state["safe_moves"] = safe_moves
 
         debug_info: Dict[str, Any] = {}
@@ -515,7 +581,7 @@ class SnakeAgent:
         if len(safe_moves) == 1:
             return safe_moves[0], debug_info
 
-        heuristic_scores = self._get_heuristic_scores(snake, safe_moves, food, life)
+        heuristic_scores, heuristic_meta = self._get_heuristic_scores(snake, safe_moves, food, life)
 
         rsm_depth = max(config.RSM_MIN_DEPTH, min(config.RSM_MAX_DEPTH, len(snake) // 4))
         self.total_rsm_depth += rsm_depth
@@ -527,7 +593,9 @@ class SnakeAgent:
         a_star_path = self._a_star_pathfinding(snake[0], food, obstacles)
         debug_info["a_star_path"] = a_star_path
 
-        best, final_scores = self._combine_scores(heuristic_scores, rsm_scores, a_star_path, safe_moves, snake[0])
+        best, final_scores = self._combine_scores(
+            heuristic_scores, heuristic_meta, rsm_scores, a_star_path, safe_moves, snake[0]
+        )
 
         # Apply soft loop/oscillation penalties and re-select.
         for mv in list(final_scores.keys()):
@@ -541,5 +609,33 @@ class SnakeAgent:
         self._recent_moves.appendleft(best)
         self._recent_heads.appendleft((snake[0][0] + best[0], snake[0][1] + best[1]))
 
+        debug_info["heuristic_scores"] = heuristic_scores
+        debug_info["heuristic_meta"] = heuristic_meta
         debug_info["final_scores"] = final_scores
+        best_meta = heuristic_meta.get(best, {})
+        metric_summary = {
+            "safe_moves": len(safe_moves),
+            "final_best": max(final_scores.values()) if final_scores else 0.0,
+            "final_avg": float(sum(final_scores.values()) / len(final_scores)) if final_scores else 0.0,
+            "final_min": min(final_scores.values()) if final_scores else 0.0,
+            "a_star_len": len(a_star_path),
+            "tuner_safety": self.tuner.safety_bias,
+            "tuner_reward": self.tuner.reward_bias,
+            "life": float(life) if life is not None else float("nan"),
+            "memory_size": len(self.symbolic_memory.memory),
+            "adaptive_target": config.ADAPTIVE_TARGET_FORCED_RATE,
+            "best_reachable": best_meta.get("reachable", 0.0),
+            "best_pocket": best_meta.get("pocket", 0.0),
+            "best_future_safe": best_meta.get("future_safe", 0.0),
+            "best_coarse_space": best_meta.get("coarse_space", 0.0),
+            "best_ok": best_meta.get("ok", 0.0),
+        }
+        debug_info["metrics"] = metric_summary
         return best, debug_info
+
+    def tuner_metrics(self) -> Dict[str, float]:
+        return {
+            "safety_bias": self.tuner.safety_bias,
+            "reward_bias": self.tuner.reward_bias,
+            "best_score": float(self.tuner.best_score),
+        }

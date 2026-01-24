@@ -21,6 +21,7 @@ import msgpack
 
 from . import config
 from .rules import legal_moves
+from .utils import segment_age_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class SymbolicMemory:
         snake: Deque[Tuple[int, int]],
         food: Optional[Tuple[int, int]],
         direction: Tuple[int, int],
+        segment_ages: Optional[Tuple[float, ...]] = None,
     ) -> Tuple:
         """Create a compact generalized state key."""
         head = snake[0]
@@ -76,7 +78,8 @@ class SymbolicMemory:
                 is_body = pos in obstacles
                 obstacle_map.append(is_wall or is_body)
 
-        return (food_dir, tuple(obstacle_map), direction)
+        ages = segment_ages if segment_ages is not None else segment_age_sequence(snake)
+        return (food_dir, tuple(obstacle_map), direction, ages)
 
     def create_symbolic_state(
         self,
@@ -96,7 +99,7 @@ class SymbolicMemory:
 
         return {
             "snake_head": head,
-            "snake_body": snake,
+            "snake_body": tuple(snake),
             "food": food,
             "direction": direction,
             "distance_sq": distance_sq,
@@ -140,7 +143,8 @@ class SymbolicMemory:
 
     def update_memory(self, state: Dict[str, Any], action: Tuple[int, int], reward: float) -> None:
         """Update state-action statistics."""
-        key = self.create_state_key(state["snake_body"], state["food"], state["direction"])
+        length = len(state["snake_body"])
+        key = self.create_state_key(state["snake_body"], state["food"], state["direction"], state.get("segment_ages", tuple()))
         action_str = f"{action[0]},{action[1]}"
         self.total_updates += 1
 
