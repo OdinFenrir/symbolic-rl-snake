@@ -155,6 +155,61 @@ class SnakeAgent:
 
         return reachable, total_open, tail_reachable, pocket
 
+    def _post_eat_escape_ok(self, snake_after: Deque[Cell]) -> bool:
+
+        """Extra guard for eating moves.
+
+
+        After eating, the tail does not move, so narrow corridors can become immediate traps.
+
+        Accept the eat move only if there exists at least one *next* safe move (assuming we don't eat again)
+
+        that restores tail reachability or keeps a comfortable reachable component.
+
+        """
+
+        safe_next = self._safe_moves_with_tail_rule(snake_after, food=None)
+
+        if not safe_next:
+
+            return False
+
+
+        # Avoid relying solely on an immediate reverse unless it's the only safe choice.
+
+        preferred = list(safe_next)
+
+        if len(snake_after) >= 2:
+
+            cur_dir = (snake_after[0][0] - snake_after[1][0], snake_after[0][1] - snake_after[1][1])
+
+            rev = (-cur_dir[0], -cur_dir[1])
+
+            non_rev = [m for m in preferred if m != rev]
+
+            if non_rev:
+
+                preferred = non_rev
+
+
+        for m in preferred:
+
+            snake2, _ate2 = self._simulate_step(snake_after, m, food=None)  # assume no eat next step
+
+            reachable2, _tot2, tail_ok2, _pocket2 = self._escape_metrics(snake2, ate_food=False)
+
+            if tail_ok2:
+
+                return True
+
+            if reachable2 >= (len(snake2) + max(4, int(self.eat_reach_slack))):
+
+                return True
+
+
+        return False
+
+
     def _safe_moves_with_tail_rule(self, snake: Deque[Cell], food: Optional[Cell]) -> List[Move]:
         """Safe moves consistent with classic snake:
         - moving into current tail cell is allowed only if we are not eating.
@@ -237,7 +292,7 @@ class SnakeAgent:
         return []
 
 
-    def _get_heuristic_scores(self, snake: Deque[Cell], safe_moves: List[Move], food: Optional[Cell]) -> Dict[Move, float]:
+    def _get_heuristic_scores(self, snake: Deque[Cell], safe_moves: List[Move], food: Optional[Cell], eat_mult: float = 3.0) -> Dict[Move, float]:
 
 
         scores: Dict[Move, float] = {}
@@ -299,6 +354,19 @@ class SnakeAgent:
 
 
 
+
+
+
+            post_eat_ok = True
+
+
+
+            if ate and ((not tail_ok) or (pocket_delta_raw > 0)):
+
+
+
+                post_eat_ok = self._post_eat_escape_ok(sim_snake)
+
             # Safety gate:
 
 
@@ -323,10 +391,15 @@ class SnakeAgent:
                 ok = bool(tail_ok) or (reachable >= (len(sim_snake) + 2))
 
 
-                if (not tail_ok) and (pocket_delta_raw >= 6):
+                if (not tail_ok) and (pocket_delta_raw >= 7):
 
 
                     ok = False
+
+
+
+            ok = bool(ok) and bool(post_eat_ok)
+
 
 
 
@@ -368,7 +441,7 @@ class SnakeAgent:
             score -= self.pocket_penalty * float(pocket)
 
 
-            score -= self.pocket_delta_penalty * float(pocket_delta) * (2.0 if ate else 1.0)
+            score -= self.pocket_delta_penalty * float(pocket_delta) * (3.0 if ate else 1.0) * (2.25 if not tail_ok else 1.0)
 
 
 
@@ -490,7 +563,7 @@ class SnakeAgent:
     # ----------------------------
     # Main decision
     # ----------------------------
-    def choose_action(self, snake: Deque[Cell], food: Optional[Cell], direction: Move) -> Tuple[Move, Dict[str, Any]]:
+    def choose_action(self, snake: Deque[Cell], food: Optional[Cell], direction: Move, life: Optional[float] = None) -> Tuple[Move, Dict[str, Any]]:
         self.decision_count += 1
 
         # Use tail-rule safe moves (more accurate than "new_head in snake" checks).
@@ -506,7 +579,16 @@ class SnakeAgent:
         if len(safe_moves) == 1:
             return safe_moves[0], debug_info
 
-        heuristic_scores = self._get_heuristic_scores(snake, safe_moves, food)
+        life_frac = 1.0
+        if life is not None:
+            try:
+                life_frac = float(life) / float(config.MAX_LIFE)
+            except Exception:
+                life_frac = 1.0
+            life_frac = max(0.0, min(1.0, life_frac))
+        eat_mult = 1.0 + 2.0 * life_frac
+
+        heuristic_scores = self._get_heuristic_scores(snake, safe_moves, food, eat_mult=eat_mult)
 
         rsm_depth = max(config.RSM_MIN_DEPTH, min(config.RSM_MAX_DEPTH, len(snake) // 4))
         self.total_rsm_depth += rsm_depth

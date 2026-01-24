@@ -58,10 +58,6 @@ def run(
     scores: list[int] = []
 
     session_safety_rejects = 0
-
-    session_safety_forced = 0
-    session_safety_rejects = 0
-
     session_safety_forced = 0
     total_steps = 0
     t0 = time.time()
@@ -97,7 +93,7 @@ def run(
                 pre_move_state = agent.symbolic_memory.create_symbolic_state(
                     game.snake, game.food, game.direction
                 )
-                action, debug_info = agent.choose_action(game.snake, game.food, game.direction)
+                action, debug_info = agent.choose_action(game.snake, game.food, game.direction, game.life)
 
                 reward = game.move_snake(action, pre_move_state)
                 agent.symbolic_memory.update_memory(pre_move_state, action, reward)
@@ -123,10 +119,8 @@ def run(
             scores.append(game.score)
             elapsed_game = time.time() - start_game_time
             stats = agent.end_episode_stats()
-            session_safety_rejects += int(stats.get("safety_rejects", 0))
-            session_safety_forced += int(stats.get("safety_forced", 0))
-            session_safety_rejects += int(stats.get("safety_rejects", 0))
-            session_safety_forced += int(stats.get("safety_forced", 0))
+            session_safety_rejects += int(stats.get('safety_rejects', 0))
+            session_safety_forced += int(stats.get('safety_forced', 0))
             logger.info(
                 "Game %d/%d: Score=%d Steps=%d (%.2fs) | safety rejects=%d forced=%d",
                 i + 1,
