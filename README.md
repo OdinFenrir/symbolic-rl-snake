@@ -1,96 +1,86 @@
 # Snake Agent
 
-A compact Snake implementation with an autonomous agent. The agent chooses moves using a blend of:
+A compact Snake implementation where a hybrid agent blends:
 - local safety/space heuristics
 - shortest-path guidance toward food (A*)
-- a persistent experience memory that updates after each move
+- persistent symbolic experience memory that rewrites itself after each move
 
-The project supports both a pygame windowed mode and a fast headless mode.
+Supports both a windowed pygame mode and a fast headless evaluation mode. The runtime adapts penalties/rewards over time and includes an ESC-driven menu for clearing state or quitting cleanly.
 
 ## Quickstart
 
-Install dependencies:
+### 1. Install dependencies
 
-```bash
+`ash
 python -m pip install -r requirements.txt
-```
+`
 
-Run (windowed):
+### 2. Run locally
 
-```bash
+Windowed (default window + debug overlay):
+
+`ash
 python main.py
-```
+`
 
 Run headless (no window):
 
-```bash
+`ash
 python main.py --no-render --num-games 200
-```
+`
 
 Show debug overlay (scores + path):
 
-```bash
+`ash
 python main.py --debug
-```
+`
 
 ## State and persistence
 
-Runtime state is stored under `state/`:
+Runtime state lives under state/:
 
-- `state/symbolic_memory.msgpack` — learned experience values
-- `state/game_state.json` — last saved game state (used for resume)
+- state/symbolic_memory.msgpack — adaptive experience values
+- state/game_state.json — last saved board, direction, and snake
 
-Resume from the last saved game state:
+Use --load-state or python main.py --load-state to resume, or delete those files for a fresh start. Useful scripts live under scripts/:
 
-```bash
-python main.py --load-state
-```
-
-Snapshot your current state into git (recommended workflow):
-1. Run the game until you are happy with the learned behavior.
-2. Commit `state/` and tag the commit, e.g. `snapshot-YYYYMMDD`.
-
-Reset to a fresh start (delete state files):
-
-```bash
-del state\symbolic_memory.msgpack
-del state\game_state.json
-```
-
-
-
-### Useful scripts
-
-- `scripts/migrate_state.ps1` / `.sh`: move legacy root-level state files into `state/`.
-- `scripts/reset_state.ps1` / `.sh`: delete state files for a fresh start.
+- scripts/migrate_state.ps1 / .sh: move legacy root-level state files into state/.
+- scripts/reset_state.ps1 / .sh: delete state files for a fresh start.
 
 ## CLI options
 
-- `--num-games N` / `--games N` : number of games to run (default: 10)
-- `--no-render`   : headless mode
-- `--load-state`  : resume from `state/game_state.json` if present
-- `--debug`       : enable debug overlay in windowed mode
-- `--seed SEED`   : set RNG seed for reproducibility
-- `--max-steps N` : per-game safety cap (overrides config)
-- `--state-dir DIR` : override the state directory (isolated evaluations / experiments)
-- `--no-save` : do not write game_state or memory to disk (evaluation mode)
-- `--eval` : alias for `--no-save`
+| Flag | Effect |
+| --- | --- |
+| --num-games N / --games N | Number of games to run (default: 10) |
+| --no-render | Headless mode |
+| --load-state | Resume from state/game_state.json |
+| --debug | Enable the debug overlay (scores + A* path) |
+| --seed SEED | Random seed for reproducibility |
+| --max-steps N | Per-game safety cap (overrides config) |
+| --state-dir DIR | Override the state directory (isolated runs) |
+| --no-save / --eval | Do not write game state or memory (evaluation mode) |
 
-### Adaptive tuning
+## Adaptive tuning
 
-Runs automatically shape their own reward and safety balance. After each episode the agent monitors forced/reject counts and nudges its pocket penalties, heuristic rewards, and repeat penalties toward the settings that keep forced rates near the configured target (currently ~2%) while still rewarding longer runs, so you can just run `python -m main` and focus on evaluating the behavior instead of tweaking knobs manually.
+The agent monitors forced/reject counters and keeps a short history of the forced rate plus scores. After each episode it nudges pocket/reward scaling so the forced-rate drifts toward the configured target (≈2%) while still rewarding longer runs—no manual penalty tweaking required.
 
-### Interactive menu
+## Interactive menu
 
-When rendering with `python main.py` (or `python -m snake` without `--no-render`), press `Esc` to pause and open the menu. From there you can resume, access the options submenu, clear the persisted memory/`game_state.json`, or quit cleanly. The menu manages the persistence files for you, and any memory reset triggers a rebuild on the next games.
+Windowed runs now support an Esc-driven menu. Press Esc to pause, navigate with ↑/↓ and Enter, clear state/symbolic_memory.msgpack or state/game_state.json, or quit cleanly. The menu synchronizes with the CLI so memory clears happen before the next game starts.
+
+## Testing & automation
+
+- python -m pytest tests/test_smoke.py ensures the CLI loop runs headless without crashing (GitHub Actions runs this on every push).  
+- The GitHub Actions workflow (.github/workflows/ci.yml) runs the headless smoke test plus linting.
 
 ## Repository structure
 
-- `snake/` : library code (agent, game, memory, config, CLI)
-- `main.py` : convenience entrypoint (calls `python -m snake`)
-- `state/` : persisted runtime state (commit when you want a snapshot)
-- `tests/` : minimal smoke tests
+- snake/ : library code (agent, game, memory, config, CLI)  
+- main.py : convenience entrypoint (calls python -m snake)  
+- state/ : persisted runtime state (commit when you want a snapshot)  
+- scripts/ : helper scripts to migrate/reset state  
+- 	ests/ : minimal smoke tests
 
 ## License
 
-MIT (see `LICENSE`).
+MIT (see LICENSE).
