@@ -55,6 +55,7 @@ class SnakeGame:
         self.all_coords: Set[Tuple[int, int]] = {
             (r, c) for r in range(config.BOARD_SIZE) for c in range(config.BOARD_SIZE)
         }
+        self.won = False
         self.reset()
 
     def reset(self) -> None:
@@ -72,6 +73,8 @@ class SnakeGame:
         available_positions = self.all_coords - self.occupied_cells
         if not available_positions:
             logger.info("No space for food - snake wins")
+            self.game_over = True
+            self.won = True
             return None
         # Deterministic when seeded (set order is not stable).
         return self.rng.choice(sorted(available_positions))
@@ -121,32 +124,24 @@ class SnakeGame:
 
 
         if ate_food:
-
             self.score += 1
-
             self.life = min(self.life + config.LIFE_PER_FOOD, config.MAX_LIFE)
-
-            # Keep tail (grow)
-
         else:
-
-            # Normal move: tail advances (this also makes "move into tail" safe when not eating)
-
             self.snake.pop()
-
-
-        # Rebuild occupancy to avoid edge-case desync (e.g., head stepping onto tail cell)
 
         self.occupied_cells = set(self.snake)
 
-
+        next_food = None
         if ate_food:
+            next_food = self._place_food()
+            if next_food is None:
+                self.food = None
+                self.life = min(self.life, config.MAX_LIFE)
+                return new_head, ate_food
 
-            self.food = self._place_food()
-
+        self.food = next_food
 
         self.life -= 1
-
         return new_head, ate_food
 
     def _compute_reward(self, ate_food: bool, new_head: Tuple[int, int], pre_move_state: Dict[str, Any]) -> float:

@@ -40,6 +40,11 @@ def run(
     no_save: bool,
 ) -> int:
     config.UI_DEBUG_MODE = bool(debug)
+    config_snapshot = {
+        "SAVE_GAME_STATE": config.SAVE_GAME_STATE,
+        "SAVE_MEMORY": config.SAVE_MEMORY,
+        "MAX_STEPS_PER_GAME": config.MAX_STEPS_PER_GAME,
+    }
     if state_dir:
         config.set_state_dir(state_dir)
 
@@ -166,6 +171,28 @@ def run(
             if save_interval > 0 and ((i + 1) % save_interval == 0):
                 agent.symbolic_memory.save_memory()
 
+        game.save_game_state()
+        agent.symbolic_memory.save_memory()
+        if jsonl_f is not None:
+            jsonl_f.close()
+
+        elapsed = time.time() - t0
+        if scores:
+            logger.info(
+                "Session: avg=%.2f max=%d games=%d total_steps=%d (%.2fs)",
+                sum(scores) / len(scores),
+                max(scores),
+                len(scores),
+                total_steps,
+                elapsed,
+            )
+            try:
+                logger.info("Safety totals: rejects=%d forced=%d", session_safety_rejects, session_safety_forced)
+                if total_steps > 0:
+                    logger.info("forced_rate=%.2f%%", 100.0 * session_safety_forced / float(total_steps))
+            except NameError:
+                pass
+        return 0
     except KeyboardInterrupt:
         logger.info("Interrupted; saving state...")
         game.save_game_state()
@@ -173,30 +200,9 @@ def run(
         if jsonl_f is not None:
             jsonl_f.close()
         return 130
-
-    game.save_game_state()
-    agent.symbolic_memory.save_memory()
-    if jsonl_f is not None:
-        jsonl_f.close()
-
-    elapsed = time.time() - t0
-    if scores:
-        logger.info(
-            "Session: avg=%.2f max=%d games=%d total_steps=%d (%.2fs)",
-            sum(scores) / len(scores),
-            max(scores),
-            len(scores),
-            total_steps,
-            elapsed,
-        )
-        # Safety totals (optional: only if session counters exist)
-        try:
-            logger.info("Safety totals: rejects=%d forced=%d", session_safety_rejects, session_safety_forced)
-            if total_steps > 0:
-                logger.info("forced_rate=%.2f%%", 100.0 * session_safety_forced / float(total_steps))
-        except NameError:
-            pass
-    return 0
+    finally:
+        for attr, value in config_snapshot.items():
+            setattr(config, attr, value)
 
 def main(argv: Optional[list[str]] = None) -> int:
     # Ensure pygame banner stays hidden even when importing via `snake.cli`.
