@@ -131,16 +131,13 @@ class SnakeGame:
 
         self.occupied_cells = set(self.snake)
 
-        next_food = None
         if ate_food:
             next_food = self._place_food()
             if next_food is None:
                 self.food = None
                 self.life = min(self.life, config.MAX_LIFE)
                 return new_head, ate_food
-
-        self.food = next_food
-
+            self.food = next_food
         self.life -= 1
         return new_head, ate_food
 
