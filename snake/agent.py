@@ -14,6 +14,62 @@ from .memory import SymbolicMemory
 
 logger = logging.getLogger(__name__)
 
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+class AdaptiveTuner:
+    """Keep a short history of safety/score metrics and gently rebalance heuristics."""
+
+    def __init__(self) -> None:
+        self.forced_history: Deque[float] = deque(maxlen=config.ADAPTIVE_HISTORY_SIZE)
+        self.score_history: Deque[float] = deque(maxlen=config.ADAPTIVE_HISTORY_SIZE)
+        self.safety_bias = 0.0
+        self.reward_bias = 0.0
+        self.best_score = 0
+
+    def penalty_scale(self) -> float:
+        return max(0.2, 1.0 + self.safety_bias)
+
+    def reward_scale(self) -> float:
+        return max(0.2, 1.0 + self.reward_bias)
+
+    def observe_episode(self, score: int, forced_rate: float) -> None:
+        forced = max(0.0, forced_rate)
+        self.forced_history.append(forced)
+        self.score_history.append(score)
+
+        if not self.forced_history:
+            return
+
+        avg_forced = sum(self.forced_history) / len(self.forced_history)
+        delta_forced = avg_forced - config.ADAPTIVE_TARGET_FORCED_RATE
+        self.safety_bias = _clamp(
+            self.safety_bias + delta_forced * config.ADAPTIVE_SAFETY_ADJUST_SCALE,
+            -config.ADAPTIVE_SAFETY_BIAS_CAP,
+            config.ADAPTIVE_SAFETY_BIAS_CAP,
+        )
+        self.reward_bias = _clamp(
+            self.reward_bias - delta_forced * config.ADAPTIVE_REWARD_ADJUST_SCALE,
+            -config.ADAPTIVE_REWARD_BIAS_CAP,
+            config.ADAPTIVE_REWARD_BIAS_CAP,
+        )
+
+        if score > self.best_score:
+            self.best_score = score
+            self.reward_bias = _clamp(
+                self.reward_bias + config.ADAPTIVE_SCORE_BOOST,
+                -config.ADAPTIVE_REWARD_BIAS_CAP,
+                config.ADAPTIVE_REWARD_BIAS_CAP,
+            )
+        else:
+            self.reward_bias = _clamp(
+                self.reward_bias - config.ADAPTIVE_SCORE_DECAY,
+                -config.ADAPTIVE_REWARD_BIAS_CAP,
+                config.ADAPTIVE_REWARD_BIAS_CAP,
+            )
+
 Move = Tuple[int, int]
 Cell = Tuple[int, int]
 
@@ -63,6 +119,9 @@ class SnakeAgent:
         self._recent_heads: Deque[Cell] = deque(maxlen=32)
         self._recent_moves: Deque[Move] = deque(maxlen=16)
 
+        # Adaptive heuristics tuner
+        self.tuner = AdaptiveTuner()
+
     def begin_episode(self) -> None:
         """Reset per-episode instrumentation counters."""
         self._ep_safety_rejects = 0
@@ -81,6 +140,20 @@ class SnakeAgent:
             "safety_rejects": int(self._ep_safety_rejects),
             "safety_forced": int(self._ep_safety_forced),
         }
+
+    def record_episode_stats(self, score: int, steps: int) -> dict:
+        stats = self.end_episode_stats()
+        forced = stats.get("safety_forced", 0)
+        forced_rate = float(forced) / max(1, steps) if steps else 0.0
+        stats.update(
+            {
+                "score": score,
+                "steps": steps,
+                "forced_rate": forced_rate,
+            }
+        )
+        self.tuner.observe_episode(score, forced_rate)
+        return stats
 
     # ----------------------------
     # Utilities
@@ -269,6 +342,9 @@ class SnakeAgent:
         # Allow small pocket increases early; be stricter later.
         allow = self.pocket_increase_allow_long if len(snake) >= self.long_snake_len else self.pocket_increase_allow_short
 
+        penalty_scale = self.tuner.penalty_scale()
+        reward_scale = self.tuner.reward_scale()
+
         # Starvation urgency: when life is low, bias slightly toward food.
         urgency = 0.0
         if life is not None:
@@ -286,12 +362,12 @@ class SnakeAgent:
 
             # Coarse open space score.
             coarse_space = float(self._count_reachable_space(snake_body_tuple, next_head))
-            score = coarse_space
+            score = coarse_space * reward_scale
 
             # Gentle urgency-to-food shaping when life is low.
             if food is not None and urgency > 0.0:
                 d_after = abs(next_head[0] - food[0]) + abs(next_head[1] - food[1])
-                score += 4.0 * urgency * float(base_food_dist - d_after)
+                score += reward_scale * 4.0 * urgency * float(base_food_dist - d_after)
 
             # Simulate and evaluate topology.
             sim_snake, ate = self._simulate_step(snake, move, food)
@@ -329,8 +405,8 @@ class SnakeAgent:
             # Allow small increases without harsh delta penalty.
             pocket_delta_eff = max(0, int(pocket_delta) - int(allow))
 
-            score -= self.pocket_penalty * float(pocket)
-            score -= self.pocket_delta_penalty * float(pocket_delta_eff) * (2.0 if ate else 1.0)
+            score -= self.pocket_penalty * penalty_scale * float(pocket)
+            score -= self.pocket_delta_penalty * penalty_scale * float(pocket_delta_eff) * (2.0 if ate else 1.0)
 
             if ok and pocket == 0:
                 score += 2.0
@@ -353,7 +429,7 @@ class SnakeAgent:
         if ok_any:
             for mv, ok in ok_map.items():
                 if not ok:
-                    scores[mv] += self.escape_fail_penalty
+                    scores[mv] += self.escape_fail_penalty * penalty_scale
 
         # Instrumentation aggregation (per decision).
         if rejected_this_step:

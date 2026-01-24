@@ -7,7 +7,8 @@ import logging
 import math
 import random
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Optional, Set, Tuple
 
 from . import config
 
@@ -43,6 +44,13 @@ class SnakeGame:
             self.clock = self.pygame.time.Clock()
             self.font = self.pygame.font.SysFont("Arial", 22, bold=True)
             self.debug_font = self.pygame.font.SysFont("Arial", 14)
+
+        self.menu_visible = bool(self.render_enabled)
+        self.menu_state = "main"
+        self.menu_index = 0
+        self.menu_has_started = False
+        self.menu_message = "Use ↑/↓ to navigate, Enter to select."
+        self.menu_memory_requested = False
 
         self.all_coords: Set[Tuple[int, int]] = {
             (r, c) for r in range(config.BOARD_SIZE) for c in range(config.BOARD_SIZE)
@@ -236,6 +244,145 @@ class SnakeGame:
         pg.display.flip()
         if self.clock:
             self.clock.tick(config.FPS)
+
+    def _current_menu_items(self) -> list[tuple[str, Callable[[], None]]]:
+        if self.menu_state == "main":
+            resume_label = "Resume Game" if self.menu_has_started else "Start Game"
+            return [
+                (resume_label, self._menu_action_resume),
+                ("Options", self._menu_action_open_options),
+                ("Quit", self._menu_action_quit),
+            ]
+        return [
+            ("Clear Memory", self._menu_action_clear_memory),
+            ("Clear Game State", self._menu_action_clear_game_state),
+            ("Fresh Start (memory + state)", self._menu_action_clear_all),
+            ("Back", self._menu_action_back_to_main),
+        ]
+
+    def _menu_action_resume(self) -> None:
+        self.menu_visible = False
+        self.menu_has_started = True
+        self.menu_message = "Resuming game..."
+
+    def _menu_action_open_options(self) -> None:
+        self.menu_state = "options"
+        self.menu_index = 0
+        self.menu_message = "Pick which data to reset."
+
+    def _menu_action_back_to_main(self) -> None:
+        self.menu_state = "main"
+        self.menu_index = 0
+        self.menu_message = "Back to the main menu."
+
+    def _menu_action_clear_memory(self) -> None:
+        self._clear_memory_files()
+        self.menu_memory_requested = True
+        self.menu_message = "Persistent memory cleared; agent will rebuild knowledge."
+
+    def _menu_action_clear_game_state(self) -> None:
+        if self._clear_persistent_file(config.GAME_STATE_FILE):
+            self.menu_message = "Saved game state deleted."
+        else:
+            self.menu_message = "No saved state to delete."
+
+    def _menu_action_clear_all(self) -> None:
+        self._clear_memory_files()
+        self._clear_persistent_file(config.GAME_STATE_FILE)
+        self.menu_memory_requested = True
+        self.menu_message = "Memory and saved state removed."
+
+    def _menu_action_quit(self) -> None:
+        raise KeyboardInterrupt("Quit requested from in-game menu")
+
+    def _handle_menu_key(self, key: int) -> None:
+        if not self.pygame:
+            return
+        items = self._current_menu_items()
+        if not items:
+            return
+        if key in (self.pygame.K_UP, self.pygame.K_w):
+            self.menu_index = (self.menu_index - 1) % len(items)
+            return
+        if key in (self.pygame.K_DOWN, self.pygame.K_s):
+            self.menu_index = (self.menu_index + 1) % len(items)
+            return
+        if key in (self.pygame.K_RETURN, self.pygame.K_KP_ENTER):
+            _, handler = items[self.menu_index]
+            handler()
+
+    def _clear_persistent_file(self, path_str: str) -> bool:
+        path = Path(path_str)
+        if not path.exists():
+            return False
+        try:
+            path.unlink()
+            return True
+        except OSError as exc:
+            logger.warning("Unable to delete %s: %s", path, exc)
+            return False
+
+    def _clear_memory_files(self) -> None:
+        for suffix in ("", ".bak", ".tmp"):
+            self._clear_persistent_file(config.MEMORY_FILE + suffix)
+
+    def handle_pygame_events(self) -> None:
+        if not self.render_enabled or self.pygame is None:
+            return
+        for event in self.pygame.event.get():
+            if event.type == self.pygame.QUIT:
+                raise KeyboardInterrupt
+            if event.type == self.pygame.KEYDOWN:
+                if event.key == self.pygame.K_ESCAPE:
+                    if self.menu_visible:
+                        self.menu_visible = False
+                        self.menu_message = "Menu closed; resuming."
+                        continue
+                    self.menu_visible = True
+                    self.menu_state = "main"
+                    self.menu_index = 0
+                    self.menu_message = "Menu opened."
+                    continue
+                if self.menu_visible:
+                    self._handle_menu_key(event.key)
+
+    def render_menu(self) -> None:
+        if not self.render_enabled or self.screen is None or self.pygame is None:
+            return
+        pg = self.pygame
+        overlay = pg.Surface((config.WINDOW_SIZE, config.WINDOW_SIZE))
+        overlay.set_alpha(220)
+        overlay.fill((12, 12, 20))
+        self.screen.blit(overlay, (0, 0))
+
+        if self.font:
+            title = self.font.render("Snake Menu", True, (255, 255, 255))
+            self.screen.blit(title, ((config.WINDOW_SIZE - title.get_width()) / 2, 60))
+
+        items = self._current_menu_items()
+        for idx, (label, _) in enumerate(items):
+            prefix = "→ " if idx == self.menu_index else "  "
+            color = (255, 220, 120) if idx == self.menu_index else (190, 190, 220)
+            if self.font:
+                text_surf = self.font.render(f"{prefix}{label}", True, color)
+                self.screen.blit(text_surf, (80, 140 + idx * 32))
+
+        if self.font:
+            msg_surf = self.font.render(self.menu_message, True, (200, 200, 200))
+            self.screen.blit(msg_surf, (80, config.WINDOW_SIZE - 70))
+            hint = self.font.render("ESC toggles menu, Enter selects.", True, (150, 150, 180))
+            self.screen.blit(hint, (80, config.WINDOW_SIZE - 40))
+
+        pg.display.flip()
+        if self.clock:
+            self.clock.tick(config.FPS)
+
+    def block_until_menu_closed(self) -> None:
+        if not self.render_enabled or self.pygame is None:
+            return
+        while self.menu_visible:
+            self.handle_pygame_events()
+            self.render_menu()
 
     def save_game_state(self) -> None:
         if not config.SAVE_GAME_STATE:

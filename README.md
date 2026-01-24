@@ -76,6 +76,14 @@ del state\game_state.json
 - `--no-save` : do not write game_state or memory to disk (evaluation mode)
 - `--eval` : alias for `--no-save`
 
+### Adaptive tuning
+
+Runs automatically shape their own reward and safety balance. After each episode the agent monitors forced/reject counts and nudges its pocket penalties, heuristic rewards, and repeat penalties toward the settings that keep forced rates near the configured target (currently ~2%) while still rewarding longer runs, so you can just run `python -m main` and focus on evaluating the behavior instead of tweaking knobs manually.
+
+### Interactive menu
+
+When rendering with `python main.py` (or `python -m snake` without `--no-render`), press `Esc` to pause and open the menu. From there you can resume, access the options submenu, clear the persisted memory/`game_state.json`, or quit cleanly. The menu manages the persistence files for you, and any memory reset triggers a rebuild on the next games.
+
 ## Repository structure
 
 - `snake/` : library code (agent, game, memory, config, CLI)

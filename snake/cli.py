@@ -64,6 +64,8 @@ def run(
 
     # If we're rendering, pull pygame from the game (single import/init path).
     pygame = game.pygame
+    if render and game.menu_visible:
+        game.block_until_menu_closed()
 
     scores: list[int] = []
 
@@ -96,9 +98,16 @@ def run(
                 if render:
                     if pygame is None:
                         raise RuntimeError("Rendering requires pygame. Install it or run with --no-render.")
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
-                            raise KeyboardInterrupt
+                    game.handle_pygame_events()
+                    if game.menu_memory_requested:
+                        agent.symbolic_memory.memory.clear()
+                        agent.symbolic_memory.total_updates = 0
+                        agent.symbolic_memory.is_modified = False
+                        game.menu_memory_requested = False
+                        logger.info("Menu cleared persistent memory; fresh learning will start.")
+                    if game.menu_visible:
+                        game.render_menu()
+                        continue
 
                 pre_move_state = agent.symbolic_memory.create_symbolic_state(
                     game.snake, game.food, game.direction
@@ -128,7 +137,7 @@ def run(
 
             scores.append(game.score)
             elapsed_game = time.time() - start_game_time
-            stats = agent.end_episode_stats()
+            stats = agent.record_episode_stats(game.score, steps_this_game)
             session_safety_rejects += int(stats.get('safety_rejects', 0))
             session_safety_forced += int(stats.get('safety_forced', 0))
             logger.info(
