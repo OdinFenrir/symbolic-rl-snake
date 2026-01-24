@@ -1,12 +1,20 @@
-"""Persistent symbolic memory for experience-based move evaluation."""
+"""Persistent symbolic memory for experience-based move evaluation.
+
+Fixes:
+- Robust msgpack loading for tuple-based state keys.
+- Avoids strict_map_key failures ("list/tuple is not allowed for map key...").
+- One-shot backup restore (no infinite recursion).
+- Versioned on-disk format (v2) that avoids non-string map keys entirely.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
-import logging
+import time
 from collections import defaultdict
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple, Iterable
 
 import msgpack
 import numpy as np
@@ -14,6 +22,15 @@ import numpy as np
 from . import config
 
 logger = logging.getLogger(__name__)
+
+MEMORY_FORMAT_VERSION = 2
+
+
+def _deep_tuple(x: Any) -> Any:
+    """Recursively convert lists/tuples into tuples (for hashable keys)."""
+    if isinstance(x, (list, tuple)):
+        return tuple(_deep_tuple(i) for i in x)
+    return x
 
 
 class SymbolicMemory:
@@ -49,9 +66,7 @@ class SymbolicMemory:
                 if dr == 0 and dc == 0:
                     continue
                 pos = (head[0] + dr, head[1] + dc)
-                is_wall = not (
-                    0 <= pos[0] < config.BOARD_SIZE and 0 <= pos[1] < config.BOARD_SIZE
-                )
+                is_wall = not (0 <= pos[0] < config.BOARD_SIZE and 0 <= pos[1] < config.BOARD_SIZE)
                 is_body = pos in obstacles
                 obstacle_map.append(is_wall or is_body)
 
@@ -66,7 +81,9 @@ class SymbolicMemory:
         """Return a symbolic representation used by the agent."""
         head = snake[0]
         distance_sq = (
-            (head[0] - food[0]) ** 2 + (head[1] - food[1]) ** 2 if food else float("inf")
+            (head[0] - food[0]) ** 2 + (head[1] - food[1]) ** 2
+            if food
+            else float("inf")
         )
 
         safe_moves = []
@@ -170,58 +187,126 @@ class SymbolicMemory:
         self.memory = {k: self.memory[k] for k in sorted_keys[: config.MEMORY_MAX_ENTRIES]}
         self.is_modified = True
 
+    def _decode_payload(self, blob: bytes) -> Dict[Tuple, Dict[str, Any]]:
+        """Decode either legacy dict format or v2 payload format."""
+        obj = msgpack.unpackb(
+            blob,
+            raw=False,
+            strict_map_key=False,  # allow non-string keys in legacy files
+            use_list=False,        # decode arrays as tuples (hashable)
+        )
+
+        # v2 format: {"v": 2, "states": [[key, value], ...], ...}
+        if isinstance(obj, dict) and obj.get("v") == MEMORY_FORMAT_VERSION and "states" in obj:
+            states = obj.get("states", [])
+            mem: Dict[Tuple, Dict[str, Any]] = {}
+            if isinstance(states, Iterable):
+                for pair in states:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        continue
+                    k, v = pair
+                    k = _deep_tuple(k)
+                    if not isinstance(k, tuple) or not isinstance(v, dict):
+                        continue
+                    mem[k] = v
+            return mem
+
+        # legacy format: a dict with tuple-ish keys
+        if isinstance(obj, dict):
+            mem2: Dict[Tuple, Dict[str, Any]] = {}
+            for k, v in obj.items():
+                k = _deep_tuple(k)
+                if isinstance(k, tuple) and isinstance(v, dict):
+                    mem2[k] = v
+            return mem2
+
+        raise ValueError("Unsupported memory payload type")
+
     def load_memory(self) -> None:
-        """Load memory file; if missing or corrupt, start fresh."""
+        """Load memory file; if missing or corrupt, start fresh (one-shot backup restore)."""
         if not os.path.exists(config.MEMORY_FILE):
             logger.info("No memory file found; starting fresh")
             self.memory = {}
             return
 
+        def _try_load(path: str) -> Dict[Tuple, Dict[str, Any]]:
+            with open(path, "rb") as f:
+                return self._decode_payload(f.read())
+
         try:
-            with open(config.MEMORY_FILE, "rb") as f:
-                loaded_data = msgpack.load(f, raw=False)
-
-            self.memory = {
-                tuple(k) if isinstance(k, list) else k: v for k, v in loaded_data.items()
-            }
-
-            self.total_updates = max(
-                (int(v.get("last_visit_step", 0)) for v in self.memory.values()),
-                default=0,
-            )
-            logger.info("Loaded %d states from %s", len(self.memory), config.MEMORY_FILE)
+            self.memory = _try_load(config.MEMORY_FILE)
         except Exception as e:
             logger.error("Load failed: %s", e)
+
             backup_file = config.MEMORY_FILE + ".bak"
             if os.path.exists(backup_file):
                 try:
                     shutil.copy(backup_file, config.MEMORY_FILE)
                     logger.warning("Restored memory file from backup")
-                    self.load_memory()
+                    # One-shot retry only
+                    self.memory = _try_load(config.MEMORY_FILE)
                 except Exception as bak_e:
-                    logger.error("Backup restore failed: %s", bak_e)
+                    logger.error("Backup load failed: %s", bak_e)
+                    # Preserve the broken file for inspection
+                    try:
+                        ts = time.strftime("%Y%m%d-%H%M%S")
+                        corrupt_name = config.MEMORY_FILE + f".corrupt.{ts}"
+                        shutil.move(config.MEMORY_FILE, corrupt_name)
+                        logger.warning("Moved corrupt memory file to %s", corrupt_name)
+                    except Exception:
+                        pass
                     self.memory = {}
+                    return
             else:
                 logger.warning("No backup available; starting fresh")
                 self.memory = {}
+                return
+
+        self.total_updates = max(
+            (int(v.get("last_visit_step", 0)) for v in self.memory.values()),
+            default=0,
+        )
+        logger.info("Loaded %d states from %s", len(self.memory), config.MEMORY_FILE)
+
+        # If file was legacy (no version wrapper), migrate on next save.
+        # We keep it lightweight: mark modified so your normal save cadence rewrites it in v2.
+        self.is_modified = True
 
     def save_memory(self) -> None:
-        """Save memory with a backup file."""
+        """Save memory with a backup file (v2 format, atomic write)."""
         if not self.is_modified:
             return
 
         os.makedirs(os.path.dirname(config.MEMORY_FILE), exist_ok=True)
 
+        # Backup current file
         if os.path.exists(config.MEMORY_FILE):
             try:
                 shutil.copy(config.MEMORY_FILE, config.MEMORY_FILE + ".bak")
             except Exception as e:
                 logger.error("Backup failed: %s", e)
 
+        payload = {
+            "v": MEMORY_FORMAT_VERSION,
+            "total_updates": int(self.total_updates),
+            # list of pairs avoids any map-key restrictions
+            "states": [[k, v] for k, v in self.memory.items()],
+        }
+
+        tmp_path = config.MEMORY_FILE + ".tmp"
         try:
-            with open(config.MEMORY_FILE, "wb") as f:
-                msgpack.dump(self.memory, f, use_bin_type=True)
+            blob = msgpack.packb(payload, use_bin_type=True)
+            with open(tmp_path, "wb") as f:
+                f.write(blob)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, config.MEMORY_FILE)
             logger.info("Saved %d states to %s", len(self.memory), config.MEMORY_FILE)
             self.is_modified = False
         except Exception as e:
             logger.error("Save failed: %s", e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
