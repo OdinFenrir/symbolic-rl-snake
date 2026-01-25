@@ -1,22 +1,28 @@
 """Persistent symbolic memory for experience-based move evaluation.
 
-Fixes:
-- Robust msgpack loading for tuple-based state keys.
-- Avoids strict_map_key failures ("list/tuple is not allowed for map key...").
-- One-shot backup restore (no infinite recursion).
-- Versioned on-disk format (v2) that avoids non-string map keys entirely.
+Key design goals:
+- Robust msgpack persistence (backup + atomic write, tolerant decoding).
+- Lightweight generalization via compact, constant-size state keys.
+- Backwards-compatible reuse of older (v2 / legacy) memory files.
+
+Notes on keying:
+- v2 keys included the full per-segment age vector (variable length). That was precise but
+  harmed generalization and increased memory sparsity.
+- v3 introduces a compact key that uses constant-size local features and coarse length buckets.
+- For compatibility, lookups fall back to v2-style keys when available; newly learned states
+  maintain a small legacy->canonical index to preserve reuse without duplicating entries.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
 import time
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Optional, Tuple, Iterable
+from typing import Any, Deque, Dict, Iterable, Optional, Sequence, Tuple
 
-import errno
 import msgpack
 
 from . import config
@@ -25,7 +31,11 @@ from .utils import segment_age_sequence
 
 logger = logging.getLogger(__name__)
 
-MEMORY_FORMAT_VERSION = 2
+# On-disk format version for the msgpack payload.
+MEMORY_FORMAT_VERSION = 3
+
+Move = Tuple[int, int]
+Cell = Tuple[int, int]
 
 
 def _deep_tuple(x: Any) -> Any:
@@ -40,35 +50,57 @@ def _sign_i(x: int) -> int:
     return (x > 0) - (x < 0)
 
 
+def _length_bucket(length: int, cutoffs: Sequence[int]) -> int:
+    """Map a snake length to a small integer bucket based on configured cutoffs."""
+    for idx, cutoff in enumerate(cutoffs):
+        if length <= int(cutoff):
+            return idx
+    return len(cutoffs)
+
+
+def _age_bin(age_ratio: float, bins: int) -> int:
+    """Convert a normalized age ratio [0,1] to an integer bin [0..bins-1]."""
+    if bins <= 1:
+        return 0
+    # age_ratio may be slightly out of bounds due to numeric drift; clamp defensively.
+    x = float(age_ratio)
+    if x < 0.0:
+        x = 0.0
+    elif x > 1.0:
+        x = 1.0
+    b = int(x * bins)
+    if b >= bins:
+        b = bins - 1
+    return b
+
+
 class SymbolicMemory:
     """State-action memory with lightweight generalization and recursive scoring."""
 
     def __init__(self) -> None:
+        # Primary store: map from state_key -> entry.
         self.memory: Dict[Tuple, Dict[str, Any]] = {}
+
+        # For v3 learning: map legacy_key -> canonical_key (without duplicating entries).
+        self.legacy_index: Dict[Tuple, Tuple] = {}
+
         self.is_modified = False
         self.total_updates = 0
         self.load_memory()
 
-    def create_state_key(
-        self,
-        snake: Deque[Tuple[int, int]],
-        food: Optional[Tuple[int, int]],
-        direction: Tuple[int, int],
-        segment_ages: Optional[Tuple[float, ...]] = None,
-    ) -> Tuple:
-        """Create a compact generalized state key."""
-        head = snake[0]
-
-        # Food direction vector (sign only)
-        food_dir = (
+    # ----------------------------
+    # Key construction
+    # ----------------------------
+    def _food_dir(self, head: Cell, food: Optional[Cell]) -> Tuple[int, int]:
+        return (
             (_sign_i(food[0] - head[0]), _sign_i(food[1] - head[1]))
             if food
             else (0, 0)
         )
 
-        # Local obstacle map (8 neighbors)
-        obstacles = set(snake)
-        obstacle_map = []
+    def _obstacle_map(self, head: Cell, obstacles: set[Cell]) -> Tuple[bool, ...]:
+        """8-neighborhood obstacle occupancy (wall OR body)."""
+        obstacle_map: list[bool] = []
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
                 if dr == 0 and dc == 0:
@@ -76,16 +108,107 @@ class SymbolicMemory:
                 pos = (head[0] + dr, head[1] + dc)
                 is_wall = not (0 <= pos[0] < config.BOARD_SIZE and 0 <= pos[1] < config.BOARD_SIZE)
                 is_body = pos in obstacles
-                obstacle_map.append(is_wall or is_body)
+                obstacle_map.append(bool(is_wall or is_body))
+        return tuple(obstacle_map)
 
+    def _local_age_bins(
+        self,
+        head: Cell,
+        obstacles: set[Cell],
+        age_map: Dict[Cell, float],
+        *,
+        bins: int,
+    ) -> Tuple[int, ...]:
+        """8-neighborhood local age bins.
+
+        Encoding per neighbor cell:
+        -2 : wall
+        -1 : empty
+        0..bins-1 : occupied by body, binned by normalized age ratio (head=0, tail=1)
+        """
+        out: list[int] = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                pos = (head[0] + dr, head[1] + dc)
+                is_wall = not (0 <= pos[0] < config.BOARD_SIZE and 0 <= pos[1] < config.BOARD_SIZE)
+                if is_wall:
+                    out.append(-2)
+                    continue
+                if pos in obstacles:
+                    out.append(_age_bin(age_map.get(pos, 1.0), bins))
+                else:
+                    out.append(-1)
+        return tuple(out)
+
+    def create_state_key(
+        self,
+        snake: Sequence[Cell],
+        food: Optional[Cell],
+        direction: Move,
+        segment_ages: Optional[Tuple[float, ...]] = None,
+    ) -> Tuple:
+        """Create the v3 compact canonical state key (constant size)."""
+        head = snake[0]
         ages = segment_ages if segment_ages is not None else segment_age_sequence(snake)
-        return (food_dir, tuple(obstacle_map), direction, ages)
 
+        food_dir = self._food_dir(head, food)
+        obstacles = set(snake)
+        obstacle_map = self._obstacle_map(head, obstacles)
+
+        bins = int(getattr(config, "MEMORY_AGE_BINS", 4))
+        cutoffs = tuple(getattr(config, "MEMORY_LENGTH_BUCKETS", (4, 8, 16, 32, 64)))
+        length_bucket = _length_bucket(len(snake), cutoffs)
+
+        age_map: Dict[Cell, float] = {cell: age for cell, age in zip(snake, ages)}
+        local_age_bins = self._local_age_bins(head, obstacles, age_map, bins=bins)
+
+        return (food_dir, obstacle_map, direction, int(length_bucket), local_age_bins)
+
+    def create_legacy_state_key(
+        self,
+        snake: Sequence[Cell],
+        food: Optional[Cell],
+        direction: Move,
+        segment_ages: Optional[Tuple[float, ...]] = None,
+    ) -> Tuple:
+        """Create the v2-style key (includes the full age sequence)."""
+        head = snake[0]
+        ages = segment_ages if segment_ages is not None else segment_age_sequence(snake)
+        food_dir = self._food_dir(head, food)
+        obstacles = set(snake)
+        obstacle_map = self._obstacle_map(head, obstacles)
+        return (food_dir, obstacle_map, direction, ages)
+
+    def _lookup_entry(self, canonical_key: Tuple, legacy_key: Tuple) -> Optional[Dict[str, Any]]:
+        entry = self.memory.get(canonical_key)
+        if entry is not None:
+            return entry
+
+        if bool(getattr(config, "MEMORY_ENABLE_LEGACY_FALLBACK", True)):
+            # Direct legacy-key lookup (for loaded v2/legacy memory files).
+            entry = self.memory.get(legacy_key)
+            if entry is not None:
+                return entry
+
+            # Legacy index for v3-learned states (legacy -> canonical).
+            mapped = self.legacy_index.get(legacy_key)
+            if mapped is not None:
+                return self.memory.get(mapped)
+
+        return None
+
+    # ----------------------------
+    # Symbolic state construction
+    # ----------------------------
     def create_symbolic_state(
         self,
-        snake: Deque[Tuple[int, int]],
-        food: Optional[Tuple[int, int]],
-        direction: Tuple[int, int],
+        snake: Deque[Cell],
+        food: Optional[Cell],
+        direction: Move,
+        *,
+        segment_ages: Optional[Tuple[float, ...]] = None,
     ) -> Dict[str, Any]:
         """Return a symbolic representation used by the agent."""
         head = snake[0]
@@ -95,24 +218,65 @@ class SymbolicMemory:
             else float("inf")
         )
 
+        ages = segment_ages if segment_ages is not None else segment_age_sequence(snake)
         safe_moves = legal_moves(snake, food, direction, forbid_reverse=True)
 
-        return {
+        # Cache key features inside the state for downstream use.
+        canonical_key = self.create_state_key(tuple(snake), food, direction, ages)
+        legacy_key = self.create_legacy_state_key(tuple(snake), food, direction, ages)
+
+        state = {
             "snake_head": head,
             "snake_body": tuple(snake),
             "food": food,
             "direction": direction,
             "distance_sq": distance_sq,
             "safe_moves": safe_moves,
+            "segment_ages": ages,
+            "snake_len": int(len(snake)),
+            "state_key": canonical_key,
+            "legacy_state_key": legacy_key,
         }
+        return state
 
-    def recursive_reasoning(self, state: Dict[str, Any], depth: int) -> Dict[Tuple[int, int], float]:
+    # ----------------------------
+    # Recursive lookahead
+    # ----------------------------
+    def recursive_reasoning(
+        self,
+        state: Dict[str, Any],
+        depth: int,
+    ) -> Tuple[Dict[Move, float], int, int]:
         """Recursive lookahead using stored values as priors."""
         if depth == 0 or not state.get("safe_moves"):
-            return {move: 0.0 for move in state.get("safe_moves", [])}
+            return ({move: 0.0 for move in state.get("safe_moves", [])}, 0, 0)
 
-        scores: Dict[Tuple[int, int], float] = defaultdict(float)
+        scores: Dict[Move, float] = defaultdict(float)
+        hits = 0
+        lookups = 0
+
+        # Prefer precomputed keys from the state when present.
+        canonical_key = state.get("state_key")
+        legacy_key = state.get("legacy_state_key")
+        if not isinstance(canonical_key, tuple) or not isinstance(legacy_key, tuple):
+            canonical_key = self.create_state_key(
+                state["snake_body"],
+                state.get("food"),
+                state["direction"],
+                state.get("segment_ages"),
+            )
+            legacy_key = self.create_legacy_state_key(
+                state["snake_body"],
+                state.get("food"),
+                state["direction"],
+                state.get("segment_ages"),
+            )
+
+        state_data = self._lookup_entry(canonical_key, legacy_key) or {}
+        actions = state_data.get("actions", {}) if isinstance(state_data, dict) else {}
+
         for move in state["safe_moves"]:
+            lookups += 1
             new_head = (state["snake_head"][0] + move[0], state["snake_head"][1] + move[1])
 
             # Simulate body advance (tail moves unless we ate the food).
@@ -124,56 +288,82 @@ class SymbolicMemory:
                 temp_snake = deque([new_head] + list(state["snake_body"])[:-1])
                 next_food = state.get("food")
 
-            key = self.create_state_key(temp_snake, next_food, move)
-
-            state_data = self.memory.get(key, {})
             action_str = f"{move[0]},{move[1]}"
-            if action_str in state_data.get("actions", {}):
-                scores[move] = float(state_data["actions"][action_str]["avg_reward"])
+            action_info = actions.get(action_str)
+            if isinstance(action_info, dict) and "avg_reward" in action_info:
+                hits += 1
+                scores[move] = float(action_info["avg_reward"])
 
             new_state = self.create_symbolic_state(temp_snake, next_food, move)
-            future_scores = self.recursive_reasoning(new_state, depth - 1)
+            future_scores, future_hits, future_lookups = self.recursive_reasoning(new_state, depth - 1)
+            hits += future_hits
+            lookups += future_lookups
 
             if future_scores:
-                scores[move] += config.RSM_DECAY_FACTOR * max(future_scores.values())
+                scores[move] += float(config.RSM_DECAY_FACTOR) * max(future_scores.values())
             else:
-                scores[move] += config.PENALTY_DEATH * config.RSM_DECAY_FACTOR
+                scores[move] += float(config.PENALTY_DEATH) * float(config.RSM_DECAY_FACTOR)
 
-        return scores
+        return scores, hits, lookups
 
-    def update_memory(self, state: Dict[str, Any], action: Tuple[int, int], reward: float) -> None:
+    # ----------------------------
+    # Updates / pruning
+    # ----------------------------
+    def update_memory(self, state: Dict[str, Any], action: Move, reward: float) -> None:
         """Update state-action statistics."""
-        length = len(state["snake_body"])
-        key = self.create_state_key(state["snake_body"], state["food"], state["direction"], state.get("segment_ages", tuple()))
+        # Prefer cached keys.
+        canonical_key = state.get("state_key")
+        legacy_key = state.get("legacy_state_key")
+
+        if not isinstance(canonical_key, tuple) or not isinstance(legacy_key, tuple):
+            canonical_key = self.create_state_key(
+                state["snake_body"],
+                state["food"],
+                state["direction"],
+                segment_ages=state.get("segment_ages"),
+            )
+            legacy_key = self.create_legacy_state_key(
+                state["snake_body"],
+                state["food"],
+                state["direction"],
+                segment_ages=state.get("segment_ages"),
+            )
+
         action_str = f"{action[0]},{action[1]}"
         self.total_updates += 1
 
-        if key not in self.memory:
+        if canonical_key not in self.memory:
             compact_state = {k: v for k, v in state.items() if k != "snake_body"}
-            self.memory[key] = {
+            compact_state["key_version"] = MEMORY_FORMAT_VERSION
+            self.memory[canonical_key] = {
                 "state_info": compact_state,
                 "actions": {},
                 "visits": 0,
                 "last_visit_step": 0,
             }
 
-        state_data = self.memory[key]
+        state_data = self.memory[canonical_key]
         state_data["visits"] += 1
         state_data["last_visit_step"] = self.total_updates
 
-        if action_str not in state_data["actions"]:
-            state_data["actions"][action_str] = {
+        actions = state_data.setdefault("actions", {})
+        if action_str not in actions:
+            actions[action_str] = {
                 "count": 0,
                 "total_reward": 0.0,
                 "avg_reward": 0.0,
             }
 
-        action_data = state_data["actions"][action_str]
+        action_data = actions[action_str]
         action_data["count"] += 1
         action_data["total_reward"] += float(reward)
 
         alpha = 1.0 / action_data["count"]
-        action_data["avg_reward"] = (1 - alpha) * action_data["avg_reward"] + alpha * float(reward)
+        action_data["avg_reward"] = (1 - alpha) * float(action_data["avg_reward"]) + alpha * float(reward)
+
+        # Maintain legacy->canonical mapping (no duplication of entries).
+        if canonical_key != legacy_key:
+            self.legacy_index[legacy_key] = canonical_key
 
         self.is_modified = True
 
@@ -188,16 +378,47 @@ class SymbolicMemory:
         logger.warning("Pruning memory (%d > %d)", len(self.memory), config.MEMORY_MAX_ENTRIES)
 
         pruning_scores = {
-            k: v["visits"] - (self.total_updates - v["last_visit_step"]) * config.MEMORY_RECENCY_WEIGHT
+            k: float(v.get("visits", 0)) - (float(self.total_updates) - float(v.get("last_visit_step", 0))) * float(config.MEMORY_RECENCY_WEIGHT)
             for k, v in self.memory.items()
         }
 
         sorted_keys = sorted(pruning_scores, key=pruning_scores.get, reverse=True)
-        self.memory = {k: self.memory[k] for k in sorted_keys[: config.MEMORY_MAX_ENTRIES]}
+        self.memory = {k: self.memory[k] for k in sorted_keys[: int(config.MEMORY_MAX_ENTRIES)]}
+
+        # Also prune legacy_index mappings to keys that remain.
+        live = set(self.memory.keys())
+        if self.legacy_index:
+            self.legacy_index = {lk: ck for lk, ck in self.legacy_index.items() if ck in live}
+
         self.is_modified = True
 
-    def _decode_payload(self, blob: bytes) -> tuple[Dict[Tuple, Dict[str, Any]], bool]:
-        """Decode either legacy dict format or v2 payload format."""
+    # ----------------------------
+    # Persistence and reset
+    # ----------------------------
+    def reset(self, *, delete_files: bool = False) -> None:
+        """Clear in-memory memory; optionally remove on-disk files.
+
+        If SAVE_MEMORY is enabled, the next save will persist the cleared state.
+        """
+        self.memory.clear()
+        self.legacy_index.clear()
+        self.total_updates = 0
+        self.is_modified = True
+
+        if delete_files:
+            self._delete_memory_files()
+
+    def _delete_memory_files(self) -> None:
+        for suffix in ("", ".bak", ".tmp"):
+            path = config.MEMORY_FILE + suffix
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as exc:
+                logger.warning("Unable to delete %s: %s", path, exc)
+
+    def _decode_payload(self, blob: bytes) -> tuple[Dict[Tuple, Dict[str, Any]], Dict[Tuple, Tuple], bool, int]:
+        """Decode legacy dict format, v2 payload, or v3 payload."""
         obj = msgpack.unpackb(
             blob,
             raw=False,
@@ -205,29 +426,46 @@ class SymbolicMemory:
             use_list=False,        # decode arrays as tuples (hashable)
         )
 
-        # v2 format: {"v": 2, "states": [[key, value], ...], ...}
-        if isinstance(obj, dict) and obj.get("v") == MEMORY_FORMAT_VERSION and "states" in obj:
+        if isinstance(obj, dict) and "v" in obj and "states" in obj:
+            v = int(obj.get("v", 0) or 0)
             states = obj.get("states", [])
             mem: Dict[Tuple, Dict[str, Any]] = {}
             if isinstance(states, Iterable):
                 for pair in states:
                     if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                         continue
-                    k, v = pair
+                    k, val = pair
                     k = _deep_tuple(k)
-                    if not isinstance(k, tuple) or not isinstance(v, dict):
+                    if not isinstance(k, tuple) or not isinstance(val, dict):
                         continue
-                    mem[k] = v
-            return mem, False
+                    mem[k] = val
 
-        # legacy format: a dict with tuple-ish keys
+            legacy_index: Dict[Tuple, Tuple] = {}
+            if v >= 3:
+                pairs = obj.get("legacy_index", [])
+                if isinstance(pairs, Iterable):
+                    for pair in pairs:
+                        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                            continue
+                        lk, ck = pair
+                        lk = _deep_tuple(lk)
+                        ck = _deep_tuple(ck)
+                        if isinstance(lk, tuple) and isinstance(ck, tuple):
+                            legacy_index[lk] = ck
+
+            total_updates = int(obj.get("total_updates", 0) or 0)
+            # If v < current version, consider it "legacy" for rewrite on next save.
+            legacy_payload = v != MEMORY_FORMAT_VERSION
+            return mem, legacy_index, legacy_payload, total_updates
+
+        # legacy dict format: a dict with tuple-ish keys
         if isinstance(obj, dict):
             mem2: Dict[Tuple, Dict[str, Any]] = {}
-            for k, v in obj.items():
+            for k, val in obj.items():
                 k = _deep_tuple(k)
-                if isinstance(k, tuple) and isinstance(v, dict):
-                    mem2[k] = v
-            return mem2, True
+                if isinstance(k, tuple) and isinstance(val, dict):
+                    mem2[k] = val
+            return mem2, {}, True, 0
 
         raise ValueError("Unsupported memory payload type")
 
@@ -236,15 +474,16 @@ class SymbolicMemory:
         if not os.path.exists(config.MEMORY_FILE):
             logger.info("No memory file found; starting fresh")
             self.memory = {}
+            self.legacy_index = {}
             self.is_modified = False
             return
 
-        def _try_load(path: str) -> tuple[Dict[Tuple, Dict[str, Any]], bool]:
+        def _try_load(path: str) -> tuple[Dict[Tuple, Dict[str, Any]], Dict[Tuple, Tuple], bool, int]:
             with open(path, "rb") as f:
                 return self._decode_payload(f.read())
 
         try:
-            self.memory, legacy = _try_load(config.MEMORY_FILE)
+            mem, legacy_index, legacy, total_updates = _try_load(config.MEMORY_FILE)
         except Exception as e:
             logger.error("Load failed: %s", e)
 
@@ -253,11 +492,9 @@ class SymbolicMemory:
                 try:
                     shutil.copy(backup_file, config.MEMORY_FILE)
                     logger.warning("Restored memory file from backup")
-                    # One-shot retry only
-                    self.memory, legacy = _try_load(config.MEMORY_FILE)
+                    mem, legacy_index, legacy, total_updates = _try_load(config.MEMORY_FILE)
                 except Exception as bak_e:
                     logger.error("Backup load failed: %s", bak_e)
-                    # Preserve the broken file for inspection
                     try:
                         ts = time.strftime("%Y%m%d-%H%M%S")
                         corrupt_name = config.MEMORY_FILE + f".corrupt.{ts}"
@@ -266,15 +503,20 @@ class SymbolicMemory:
                     except Exception:
                         pass
                     self.memory = {}
+                    self.legacy_index = {}
                     return
             else:
                 logger.warning("No backup available; starting fresh")
                 self.memory = {}
+                self.legacy_index = {}
                 return
 
+        self.memory = mem
+        self.legacy_index = legacy_index
+        # Derive total_updates if missing.
         self.total_updates = max(
-            (int(v.get("last_visit_step", 0)) for v in self.memory.values()),
-            default=0,
+            int(total_updates),
+            max((int(v.get("last_visit_step", 0)) for v in self.memory.values()), default=0),
         )
         logger.info("Loaded %d states from %s", len(self.memory), config.MEMORY_FILE)
 
@@ -282,7 +524,7 @@ class SymbolicMemory:
         self.is_modified = bool(legacy)
 
     def save_memory(self) -> None:
-        """Save memory with a backup file (v2 format, atomic write)."""
+        """Save memory with a backup file (v3 format, atomic write)."""
         if not config.SAVE_MEMORY:
             return
         if not self.is_modified:
@@ -297,12 +539,14 @@ class SymbolicMemory:
             except Exception as e:
                 logger.error("Backup failed: %s", e)
 
-        payload = {
+        payload: Dict[str, Any] = {
             "v": MEMORY_FORMAT_VERSION,
             "total_updates": int(self.total_updates),
             # list of pairs avoids any map-key restrictions
             "states": [[k, v] for k, v in self.memory.items()],
         }
+        if self.legacy_index:
+            payload["legacy_index"] = [[lk, ck] for lk, ck in self.legacy_index.items()]
 
         blob = msgpack.packb(payload, use_bin_type=True)
         tmp_path = config.MEMORY_FILE + ".tmp"
@@ -338,7 +582,7 @@ class SymbolicMemory:
                     logger.error("Fallback write failed: %s", fallback_exc)
             else:
                 logger.error("Save failed: %s", exc)
-        except Exception as exc:  # pragma: no cover - fallback already handled by specific cases
+        except Exception as exc:  # pragma: no cover
             logger.error("Save failed: %s", exc)
         finally:
             try:

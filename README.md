@@ -13,6 +13,9 @@ Supports both a windowed pygame mode and a fast headless evaluation mode. The ru
 
 ```bash
 python -m pip install -r requirements.txt
+
+# Optional: analysis scripts (runs/ + scripts/) use pandas
+python -m pip install -r requirements-dev.txt
 ```
 
 ### 2. Run locally
@@ -61,6 +64,7 @@ Use --load-state or python main.py --load-state to resume, or delete those files
 | --max-steps N | Per-game safety cap (overrides config) |
 | --state-dir DIR | Override the state directory (isolated runs) |
 | --no-save / --eval | Skip writing game or memory state (evaluation mode) |
+| --freeze-learning | Load memory but do not update it or tune the agent (benchmark mode) |
 | --reset-memory | Delete persisted symbolic memory before running |
 | --reset-state | Delete saved game state before running |
 | --reset-all | Delete both memory and saved game state before running |
@@ -73,7 +77,7 @@ The agent monitors forced / reject counts and keeps a short history of forced ra
 
 Windowed runs now support an Esc-driven menu. Press Esc to pause, navigate with the up/down arrow keys and Enter, clear state/symbolic_memory.msgpack or state/game_state.json, or quit cleanly. The menu synchronizes with the CLI so memory clears happen before the next game starts.
 
-The options screen exposes a “Toggle tuning metrics” entry that reveals the adaptive tuner’s current `safety_bias`, `reward_bias`, and best score in the menu overlay and briefly flashes them after every memory save. Press `M` during play to open the extended live metrics panel (left side) and keep watching the heuristics, final-score distribution, life, and tuner biases in real time without opening the menu.
+The options screen exposes a "Toggle tuning metrics" entry, a "Toggle live metrics overlay" entry, and a new "Presets" entry where you can launch common benchmark runs (quick headless 50, full train/eval, frozen eval) right from the UI instead of typing CLI commands. Each preset writes its JSONL to `runs/` and logs stdout/stderr to `runs/preset_<name>.log`, so you can inspect failures; the overlay still flashes the adaptive tuner’s current `safety_bias`, `reward_bias`, and best score whenever memory is saved.
 
 ## Testing & automation
 
@@ -83,7 +87,7 @@ The options screen exposes a “Toggle tuning metrics” entry that reveals the 
 
 ## Logging & telemetry
 
-`--log-jsonl PATH` now records extra columns per episode: `forced_rate`, `safety_rejects`, `safety_forced`, `tuner_safety`, `tuner_reward`, `memory_size`, and `won`. These give you actionable benchmarking data without rendering and let you track how the adaptive tuner drifts.
+`--log-jsonl PATH` now records extra columns per episode: `forced_rate`, `safety_rejects`, `safety_forced`, `tuner_safety`, `tuner_reward`, `tuner_best`, `memory_size`, `rsm_prior_hits`, and `won`. These give you actionable benchmarking data without rendering and let you track how the adaptive tuner drifts and whether memory priors are being consulted.
 
 ## Performance tuning
 
@@ -105,6 +109,12 @@ python scripts/run_benchmark.py --seed 42 --train-games 300 --eval-games 100
 ```
 
 The script writes its logs under `runs/` and prints the descriptive statistics for both training and evaluation JSONL files.
+
+GitHub Actions now runs this helper (with a small game count) so each push produces reproducible train/eval telemetry.
+
+To see a pandas summary from inside the menu, use the new Presets entry: select “Benchmark summary” and it runs `scripts/compare_runs.py` to print training/eval `score`, `forced_rate`, `tuner_reward`, `tuner_best`, and `rsm_prior_hits`.
+
+When you want a clean benchmark, run `python -m snake --freeze-learning --state-dir state/train --log-jsonl runs/frozen.jsonl --num-games 100` so the tuner and memory stay fixed and you can compare builds deterministically.
 
 ## Visual + planning parity
 

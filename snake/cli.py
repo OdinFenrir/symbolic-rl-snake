@@ -62,6 +62,7 @@ def run(
     reset_memory: bool = False,
     reset_state: bool = False,
     reset_all: bool = False,
+    freeze_learning: bool = False,
 ) -> int:
     config.UI_DEBUG_MODE = bool(debug)
     config_snapshot = {
@@ -143,9 +144,7 @@ def run(
                         raise RuntimeError("Rendering requires pygame. Install it or run with --no-render.")
                     game.handle_pygame_events()
                     if game.menu_memory_requested:
-                        agent.symbolic_memory.memory.clear()
-                        agent.symbolic_memory.total_updates = 0
-                        agent.symbolic_memory.is_modified = False
+                        agent.reset_memory(delete_files=False)
                         game.menu_memory_requested = False
                         logger.info("Menu cleared persistent memory; fresh learning will start.")
                     if game.menu_visible:
@@ -159,7 +158,8 @@ def run(
                 game.update_live_metrics(debug_info.get("metrics", {}))
 
                 reward = game.move_snake(action, pre_move_state)
-                agent.symbolic_memory.update_memory(pre_move_state, action, reward)
+                if not freeze_learning:
+                    agent.symbolic_memory.update_memory(pre_move_state, action, reward)
 
                 if render:
                     game.render(debug_info if debug else None)
@@ -181,7 +181,7 @@ def run(
 
             scores.append(game.score)
             elapsed_game = time.time() - start_game_time
-            stats = agent.record_episode_stats(game.score, steps_this_game)
+            stats = agent.record_episode_stats(game.score, steps_this_game, observe_tuner=not freeze_learning)
             session_safety_rejects += int(stats.get('safety_rejects', 0))
             session_safety_forced += int(stats.get('safety_forced', 0))
             tuning_metrics = agent.tuner_metrics()
@@ -206,6 +206,7 @@ def run(
                     "render": bool(render),
                     "board": int(config.BOARD_SIZE),
                 }
+                row.update(stats)
                 row.update(
                     {
                         "forced_rate": float(stats.get("forced_rate", 0.0)),
@@ -215,6 +216,7 @@ def run(
                         "tuner_reward": tuning_metrics["reward_bias"],
                         "tuner_best": tuning_metrics.get("best_score", 0.0),
                         "memory_size": len(agent.symbolic_memory.memory),
+                        "rsm_prior_hits": stats.get("rsm_prior_hits", 0),
                         "won": bool(game.won),
                     }
                 )
@@ -262,6 +264,7 @@ def run(
 def main(argv: Optional[list[str]] = None) -> int:
     # Ensure pygame banner stays hidden even when importing via `snake.cli`.
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    config.configure_logging()
 
     parser = argparse.ArgumentParser(description="Snake Agent")
     parser.add_argument("--num-games", "--games", type=int, default=10, help="Number of games to run")
@@ -317,6 +320,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Alias for --no-save (kept for convenience).",
     )
+    parser.add_argument(
+        "--freeze-learning",
+        action="store_true",
+        help="Load memory but do not update it or tune the agent (true evaluation).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -337,6 +345,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             reset_memory=args.reset_memory,
             reset_state=args.reset_state,
             reset_all=args.reset_all,
+            freeze_learning=args.freeze_learning or args.eval,
         )
         profiler.disable()
         stats = pstats.Stats(profiler).sort_stats("cumulative")
@@ -358,4 +367,5 @@ def main(argv: Optional[list[str]] = None) -> int:
         reset_memory=args.reset_memory,
         reset_state=args.reset_state,
         reset_all=args.reset_all,
+        freeze_learning=args.freeze_learning or args.eval,
     )

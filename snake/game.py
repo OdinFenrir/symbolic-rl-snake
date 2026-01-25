@@ -6,12 +6,17 @@ import json
 import logging
 import math
 import random
+import subprocess
+import sys
+import textwrap
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, Optional, Set, Tuple
 
 from . import config
 from .rules import legal_moves, is_legal_move, Move
+from .utils import segment_age_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +60,61 @@ class SnakeGame:
         self.menu_show_metrics = False
         self.metrics_display = False
         self.live_metrics: Dict[str, Any] = {}
-        self.menu_show_metrics = False
         self.metrics_info: Dict[str, Any] = {}
         self.metrics_overlay: Optional[list[str]] = None
         self.metrics_overlay_ticks = 0
+        self.summary_tooltip = ""
+        self.tooltip_ticks = 0
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.runs_dir = self.repo_root / "runs"
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.state_root = self.repo_root / "state"
+        self.preset_status: Optional[str] = None
+        self.preset_stage_name: Optional[str] = None
+        self.preset_start_time: float = 0.0
+        self.preset_log_tail: list[str] = []
+        self.preset_cancel_requested = False
+        self._current_preset_log_path: Optional[Path] = None
+        self.preset_seed = 42
+        self._preset_queue: list[dict[str, Any]] = []
+        self._preset_proc: Optional[subprocess.Popen] = None
+        self._preset_log: Optional[Any] = None
+        self._preset_active_label: Optional[str] = None
+        self.summary_command = [
+            sys.executable,
+            str(self.repo_root / "compare_runs.py"),
+            "--train",
+            str(self.runs_dir / "train_preset.jsonl"),
+            "--eval",
+            str(self.runs_dir / "eval_preset.jsonl"),
+        ]
+        self.preset_list = [
+            (
+                "Quick headless 50",
+                [{"args": ["--no-render", "--num-games", "50"], "log": "quick50", "state": None}],
+            ),
+            (
+                "Train 300 / Eval 100",
+                [
+                    {"args": ["--no-render", "--num-games", "300"], "log": "train_preset", "state": "state/train"},
+                    {
+                        "args": ["--freeze-learning", "--no-render", "--num-games", "100", "--eval"],
+                        "log": "eval_preset",
+                        "state": "state/train",
+                    },
+                ],
+            ),
+            (
+                "Frozen eval 100",
+                [
+                    {
+                        "args": ["--freeze-learning", "--no-render", "--num-games", "100", "--eval"],
+                        "log": "frozen100",
+                        "state": "state/train",
+                    }
+                ],
+            ),
+        ]
 
         self.all_coords: Set[Tuple[int, int]] = {
             (r, c) for r in range(config.BOARD_SIZE) for c in range(config.BOARD_SIZE)
@@ -88,21 +144,6 @@ class SnakeGame:
             color = self._lerp_color(start_color, end_color, ratio)
             surface.fill(color, (rect.x, rect.y + y, rect.width, 1))
 
-    def _lerp_color(self, start: Tuple[int, int, int], end: Tuple[int, int, int], ratio: float) -> Tuple[int, int, int]:
-        ratio = max(0.0, min(1.0, ratio))
-        return (
-            int(start[0] + (end[0] - start[0]) * ratio),
-            int(start[1] + (end[1] - start[1]) * ratio),
-            int(start[2] + (end[2] - start[2]) * ratio),
-        )
-
-    def _fill_vertical_gradient(self, surface: Any, rect: "pygame.Rect", start_color: Tuple[int, int, int], end_color: Tuple[int, int, int]) -> None:  # type: ignore[name-defined]
-        height = max(rect.height, 1)
-        for y in range(rect.height):
-            ratio = y / (height - 1)
-            color = self._lerp_color(start_color, end_color, ratio)
-            surface.fill(color, (rect.x, rect.y + y, rect.width, 1))
-
     def reset(self) -> None:
         start_pos = (config.BOARD_SIZE // 2, config.BOARD_SIZE // 2)
         self.snake: Deque[Tuple[int, int]] = deque([start_pos])
@@ -122,7 +163,7 @@ class SnakeGame:
             self.game_over = True
             self.won = True
             return None
-        # Deterministic when seeded (set order is not stable).
+        # Random placement via RNG.
         return self.rng.choice(sorted(available_positions))
 
     def _would_eat(self, new_head: Tuple[int, int]) -> bool:
@@ -197,7 +238,17 @@ class SnakeGame:
             reward += config.PENALTY_REPEAT * min(over, config.REPEAT_PENALTY_CAP_STEPS)
 
         if new_head[0] in (0, config.BOARD_SIZE - 1) or new_head[1] in (0, config.BOARD_SIZE - 1):
-            reward += config.PENALTY_WALL_HUG
+            wall_penalty = config.PENALTY_WALL_HUG
+            food_on_border = (
+                self.food is not None
+                and (
+                    self.food[0] in (0, config.BOARD_SIZE - 1)
+                    or self.food[1] in (0, config.BOARD_SIZE - 1)
+                )
+            )
+            if food_on_border:
+                wall_penalty *= config.WALL_HUG_PENALTY_FOOD_FACTOR
+            reward += wall_penalty
 
         return reward
 
@@ -251,13 +302,12 @@ class SnakeGame:
         head_color = (0, 255, 180)
         body_start = (0, 160, 220)
         body_end = (10, 40, 80)
-        total_segments = max(len(self.snake) - 1, 1)
         for i, segment in enumerate(self.snake):
             rect = pg.Rect(segment[1] * config.GRID_SIZE, segment[0] * config.GRID_SIZE, config.GRID_SIZE, config.GRID_SIZE)
             if i == 0:
                 pg.draw.rect(self.screen, head_color, rect, border_radius=6)
             else:
-                ratio = (i - 1) / total_segments
+                ratio = segment_age_ratio(i, len(self.snake))
                 color = self._lerp_color(body_start, body_end, ratio)
                 gradient_rect = self.pygame.Rect(rect)
                 self._fill_vertical_gradient(self.screen, gradient_rect, (color[0], color[1], color[2]), (0, 0, 0))
@@ -306,6 +356,93 @@ class SnakeGame:
                 text_surf = self.font.render(line, True, (210, 210, 220))
                 self.screen.blit(text_surf, (rect.x + 10, rect.y + 28 + idx * 24))
 
+        if self.font:
+            preset_running = self._preset_proc and self._preset_proc.poll() is None
+            status_lines: list[str] = []
+            if preset_running:
+                elapsed = time.time() - self.preset_start_time if self.preset_start_time else 0.0
+                stage_label = self.preset_stage_name or "Preset"
+                status_lines.append(f"{stage_label} running • {elapsed:.1f}s")
+                self._refresh_preset_log_tail()
+                status_lines.extend(line for line in self.preset_log_tail[-3:])
+                status_lines.append("Press Esc to cancel")
+                self.preset_status = f"{stage_label} running"
+            elif self.preset_status:
+                self._refresh_preset_log_tail()
+                status_lines.append(self.preset_status)
+                status_lines.extend(line for line in self.preset_log_tail[-3:])
+            if status_lines:
+                overlay_lines: list[str] = []
+                max_overlay_width = config.WINDOW_SIZE - 40
+                font_width = self.font.size("W")[0] if self.font else 10
+                wrap_chars = max(
+                    12,
+                    (max_overlay_width - 32) // max(font_width, 1),
+                )
+                for line in status_lines:
+                    wrapped = textwrap.wrap(
+                        line,
+                        width=wrap_chars,
+                        break_long_words=True,
+                        replace_whitespace=False,
+                    )
+                    overlay_lines.extend(wrapped or [""])
+                line_width = max(self.font.size(line)[0] for line in overlay_lines)
+                overlay_width = min(line_width + 24, max_overlay_width)
+                overlay_height = len(overlay_lines) * 22 + 16
+                overlay_rect = self.pygame.Rect(
+                    (config.WINDOW_SIZE - overlay_width) / 2,
+                    20,
+                    overlay_width,
+                    overlay_height,
+                )
+                overlay = pg.Surface((overlay_width, overlay_height))
+                overlay.set_alpha(220)
+                overlay.fill((10, 16, 26))
+                self.screen.blit(overlay, overlay_rect.topleft)
+                for idx, line in enumerate(overlay_lines):
+                    text_surf = self.font.render(line, True, (240, 240, 220))
+                    text_rect = text_surf.get_rect()
+                    text_rect.midtop = (
+                        overlay_rect.x + overlay_width / 2,
+                        overlay_rect.y + 8 + idx * 22,
+                    )
+                    self.screen.blit(text_surf, text_rect.topleft)
+
+        if self.tooltip_ticks > 0 and self.summary_tooltip and self.font:
+            tooltip_lines: list[str] = []
+            font_width = self.font.size("W")[0] if self.font else 10
+            max_chars = max(32, (config.WINDOW_SIZE - 40) // max(font_width, 1))
+            for line in self.summary_tooltip.splitlines():
+                wrapped = textwrap.wrap(
+                    line,
+                    width=max_chars,
+                    break_long_words=True,
+                    replace_whitespace=False,
+                )
+                tooltip_lines.extend(wrapped or [""])
+            if not tooltip_lines:
+                tooltip_lines.append("")
+            max_width = 0
+            for line in tooltip_lines:
+                max_width = max(max_width, self.font.size(line)[0])
+            tooltip_width = max_width + 22
+            tooltip_height = len(tooltip_lines) * 22 + 16
+            tooltip_rect = self.pygame.Rect(
+                10,
+                config.WINDOW_SIZE - tooltip_height - 10,
+                tooltip_width,
+                tooltip_height,
+            )
+            tooltip_surface = pg.Surface((tooltip_width, tooltip_height))
+            tooltip_surface.set_alpha(210)
+            tooltip_surface.fill((12, 12, 20))
+            self.screen.blit(tooltip_surface, tooltip_rect.topleft)
+            for idx, line in enumerate(tooltip_lines):
+                text_surf = self.font.render(line, True, (220, 220, 255))
+                self.screen.blit(text_surf, (tooltip_rect.x + 10, tooltip_rect.y + 8 + idx * 22))
+            self.tooltip_ticks -= 1
+
         pg.display.flip()
         if self.clock:
             self.clock.tick(config.FPS)
@@ -318,6 +455,24 @@ class SnakeGame:
                 ("Options", self._menu_action_open_options),
                 ("Quit", self._menu_action_quit),
             ]
+        if self.menu_state == "options":
+            return [
+                ("Toggle tuning metrics", self._menu_action_toggle_metrics),
+                ("Presets", self._menu_action_open_presets),
+                ("Toggle live metrics overlay", self.toggle_live_metrics),
+                ("Benchmark summary", self._menu_action_show_summary),
+                ("Clear Memory", self._menu_action_clear_memory),
+                ("Clear Game State", self._menu_action_clear_game_state),
+                ("Fresh Start (memory + state)", self._menu_action_clear_all),
+                ("Back", self._menu_action_back_to_main),
+            ]
+        if self.menu_state == "presets":
+            entries = [
+                (label, lambda idx=idx: self._menu_action_launch_preset(idx))
+                for idx, (label, _) in enumerate(self.preset_list)
+            ]
+            entries.append(("Back", self._menu_action_back_to_options))
+            return entries
         return [
             ("Toggle tuning metrics", self._menu_action_toggle_metrics),
             ("Clear Memory", self._menu_action_clear_memory),
@@ -365,6 +520,167 @@ class SnakeGame:
         self.menu_show_metrics = not self.menu_show_metrics
         status = "showing" if self.menu_show_metrics else "hiding"
         self.menu_message = f"Tuning metrics {status}."
+
+    def _menu_action_open_presets(self) -> None:
+        self.menu_state = "presets"
+        self.menu_index = 0
+        self.menu_message = "Select a benchmark preset."
+
+    def _menu_action_back_to_options(self) -> None:
+        self.menu_state = "options"
+        self.menu_index = 0
+        self.menu_message = "Back to options."
+
+    def _menu_action_launch_preset(self, idx: int) -> None:
+        if self._preset_proc and self._preset_proc.poll() is None:
+            self.menu_message = "A preset is already running."
+            return
+
+        label, stages = self.preset_list[idx]
+        self._preset_queue = list(stages)
+        self._preset_active_label = label
+        self.menu_message = f"Starting preset '{label}'..."
+        self.preset_status = f"Queued '{label}'"
+        self._start_next_preset_stage()
+
+    def _menu_action_show_summary(self) -> None:
+        self.menu_message = "Displaying benchmark summary..."
+        train = self.runs_dir / "train_preset.jsonl"
+        eval_ = self.runs_dir / "eval_preset.jsonl"
+        try:
+            res = subprocess.run(
+                self.summary_command,
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            out = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
+            lines = [line for line in out.splitlines() if line.strip()]
+            if not lines:
+                lines = ["(no output)"]
+            self.metrics_overlay = lines[-25:]
+            self.metrics_overlay_ticks = int(config.FPS * 6.0)
+            self.menu_message = "Benchmark summary displayed."
+            self.summary_tooltip = f"Train summary: {train}\nEval summary: {eval_}"
+            self.tooltip_ticks = int(config.FPS * 6.0)
+            summary_path = self.runs_dir / "latest_summary.txt"
+            summary_path.write_text("\n".join(lines), encoding="utf-8")
+            self.menu_message += f" (saved to {summary_path.name})"
+        except Exception as exc:
+            self.menu_message = f"Benchmark summary failed: {exc}"
+            self.summary_tooltip = f"Summary failed: {exc}"
+            self.tooltip_ticks = int(config.FPS * 4.0)
+
+    def _start_next_preset_stage(self) -> None:
+        if not self._preset_queue:
+            self._preset_proc = None
+            if self._preset_log:
+                self._preset_log.close()
+                self._preset_log = None
+            self.menu_message = f"Preset '{self._preset_active_label}' completed."
+            self._preset_active_label = None
+            self.preset_status = "Preset completed"
+            self.preset_stage_name = None
+            self.preset_start_time = 0.0
+            self._current_preset_log_path = None
+            return
+
+        stage = self._preset_queue.pop(0)
+        cmd, log_path = self._build_preset_command(stage)
+        if self._preset_log:
+            self._preset_log.close()
+        self._preset_log = log_path.open("a", encoding="utf-8")
+        self._preset_log.write(f"\n\n=== running: {' '.join(cmd)} ===\n")
+        self._preset_proc = subprocess.Popen(
+            cmd,
+            cwd=str(self.repo_root),
+            stdout=self._preset_log,
+            stderr=subprocess.STDOUT,
+        )
+        self.menu_message = f"Running preset stage -> {log_path.name}"
+        self.preset_status = f"{self._preset_active_label}: {stage.get('log', 'stage')}"
+        self.preset_stage_name = stage.get("log", "stage")
+        self.preset_start_time = time.time()
+        self.preset_log_tail = []
+        self._current_preset_log_path = log_path
+        self.preset_cancel_requested = False
+        self._refresh_preset_log_tail()
+        self._current_preset_log_path = log_path
+        self.preset_cancel_requested = False
+
+    def _build_preset_command(self, stage: dict[str, Any]) -> tuple[list[str], Path]:
+        cmd = [sys.executable, "-m", "snake"]
+        cmd.extend(stage.get("args", []))
+        if "--seed" not in cmd:
+            cmd.extend(["--seed", str(self.preset_seed)])
+
+        state_rel = stage.get("state")
+        if state_rel:
+            state_path = self.repo_root / state_rel
+            state_path.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["--state-dir", str(state_path)])
+
+        log_path = self.runs_dir / f"{stage.get('log', 'preset')}.jsonl"
+        cmd.extend(["--log-jsonl", str(log_path)])
+        return cmd, self.runs_dir / f"preset_{stage.get('log', 'preset')}.log"
+
+    def _clean_preset_log_lines(self, lines: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for line in lines:
+            trimmed = line.strip()
+            if not trimmed:
+                continue
+            if " - " in trimmed:
+                parts = trimmed.split(" - ")
+                trimmed = parts[-1].strip()
+            cleaned.append(trimmed)
+        return cleaned
+
+
+    def _refresh_preset_log_tail(self) -> None:
+        path = self._current_preset_log_path
+        if not path or not path.exists():
+            self.preset_log_tail = []
+            return
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                lines = [line.rstrip() for line in f.readlines()]
+            self.preset_log_tail = self._clean_preset_log_lines(lines[-4:])
+        except OSError:
+            self.preset_log_tail = []
+
+    def _pump_preset_runner(self) -> None:
+        if not self._preset_proc:
+            return
+        if self._preset_proc.poll() is None:
+            return
+        returncode = self._preset_proc.returncode
+        if returncode != 0:
+            if self._preset_log:
+                self._preset_log.write(f"\nPreset stage exited with {returncode}\n")
+                self._preset_log.close()
+                self._preset_log = None
+            self._preset_proc = None
+            self._preset_queue.clear()
+            self.menu_message = (
+                f"Preset '{self._preset_active_label}' failed (exit {returncode}); see log."
+            )
+            self._preset_active_label = None
+            self.preset_status = "Preset failed"
+            return
+        self._start_next_preset_stage()
+
+    def _cancel_preset(self) -> None:
+        if not self._preset_proc or self._preset_proc.poll() is not None:
+            return
+        self.preset_cancel_requested = True
+        self.preset_status = "Cancelling preset..."
+        self.menu_message = "Cancelling preset..."
+        try:
+            self._preset_proc.terminate()
+        except Exception:
+            pass
 
     def _handle_menu_key(self, key: int) -> None:
         if not self.pygame:
@@ -431,6 +747,7 @@ class SnakeGame:
     def handle_pygame_events(self) -> None:
         if not self.render_enabled or self.pygame is None:
             return
+        self._pump_preset_runner()
         for event in self.pygame.event.get():
             if event.type == self.pygame.QUIT:
                 raise KeyboardInterrupt
@@ -439,6 +756,9 @@ class SnakeGame:
                     if self.menu_visible:
                         self.menu_visible = False
                         self.menu_message = "Menu closed; resuming."
+                        continue
+                    if self._preset_proc and self._preset_proc.poll() is None:
+                        self._cancel_preset()
                         continue
                     self.menu_visible = True
                     self.menu_state = "main"
@@ -456,11 +776,11 @@ class SnakeGame:
             return
         pg = self.pygame
         overlay = pg.Surface((config.WINDOW_SIZE, config.WINDOW_SIZE))
-        overlay.set_alpha(230)
-        overlay.fill((18, 18, 30))
+        overlay.set_alpha(240)
+        overlay.fill((12, 12, 20))
         self.screen.blit(overlay, (0, 0))
-        border = self.pygame.Rect(30, 60, config.WINDOW_SIZE - 60, config.WINDOW_SIZE - 120)
-        self.pygame.draw.rect(self.screen, (40, 40, 60), border, border_radius=16, width=2)
+        border = self.pygame.Rect(20, 40, config.WINDOW_SIZE - 40, config.WINDOW_SIZE - 80)
+        self.pygame.draw.rect(self.screen, (30, 30, 50), border, border_radius=18, width=2)
 
         if self.font:
             title = self.font.render("Snake Menu", True, (200, 230, 250))
@@ -471,22 +791,23 @@ class SnakeGame:
         items = self._current_menu_items()
         for idx, (label, _) in enumerate(items):
             prefix = "→ " if idx == self.menu_index else "  "
-            color = (255, 200, 120) if idx == self.menu_index else (210, 210, 230)
+            color = (255, 210, 150) if idx == self.menu_index else (230, 230, 240)
+            y_offset = 160 + idx * 42
             if idx == self.menu_index:
-                highlight = self.pygame.Rect(70, 130 + idx * 34, config.WINDOW_SIZE - 140, 34)
-                self.pygame.draw.rect(self.screen, (28, 80, 140), highlight, border_radius=8)
-                text_pos = (highlight.x + 10, highlight.y + 4)
+                highlight = self.pygame.Rect(60, y_offset - 8, config.WINDOW_SIZE - 120, 40)
+                self.pygame.draw.rect(self.screen, (32, 90, 150), highlight, border_radius=10)
+                text_pos = (highlight.x + 12, highlight.y + 6)
             else:
-                text_pos = (80, 140 + idx * 32)
+                text_pos = (80, y_offset)
             if self.font:
                 text_surf = self.font.render(f"{prefix}{label}", True, color)
                 self.screen.blit(text_surf, text_pos)
 
         if self.font:
-            msg_surf = self.font.render(self.menu_message, True, (200, 200, 200))
-            self.screen.blit(msg_surf, (80, config.WINDOW_SIZE - 70))
-            hint = self.font.render("ESC toggles menu, Enter selects.", True, (150, 150, 180))
-            self.screen.blit(hint, (80, config.WINDOW_SIZE - 40))
+            msg_surf = self.font.render(self.menu_message, True, (220, 220, 220))
+            self.screen.blit(msg_surf, (60, config.WINDOW_SIZE - 90))
+            hint = self.font.render("ESC=menu  Enter=select  M=metrics presets", True, (180, 180, 200))
+            self.screen.blit(hint, (60, config.WINDOW_SIZE - 50))
         if self.menu_show_metrics and self.font and self.metrics_info:
             stats = self._formatted_metrics_lines()
             for idx, text in enumerate(stats):

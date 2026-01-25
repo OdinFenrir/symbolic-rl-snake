@@ -8,11 +8,23 @@ import sys
 from pathlib import Path
 
 # Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)-12s - %(levelname)-8s - %(message)s",
-    stream=sys.stdout,
-)
+DEFAULT_LOG_FORMAT = "%(asctime)s - %(name)-12s - %(levelname)-8s - %(message)s"
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Configure root logging if the host application has not done so already.
+
+    This keeps the package library-friendly (it will not override an existing logging setup),
+    while preserving CLI ergonomics.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    logging.basicConfig(level=level, format=DEFAULT_LOG_FORMAT, stream=sys.stdout)
+
+
+configure_logging()
+
 logger = logging.getLogger("snake")
 
 
@@ -56,8 +68,8 @@ def set_state_dir(state_dir: str | Path) -> None:
 # ----------------------------
 # Game & rendering
 # ----------------------------
-BOARD_SIZE = 15
-GRID_SIZE = 40
+GRID_SIZE = 64
+BOARD_SIZE = 16
 WINDOW_SIZE = BOARD_SIZE * GRID_SIZE
 FPS = 15
 UI_DEBUG_MODE = False
@@ -67,9 +79,9 @@ MAX_STEPS_PER_GAME = 5000
 PROGRESS_LOG_INTERVAL = 200
 
 # Rewards
-INITIAL_LIFE = 1000
+INITIAL_LIFE = 2000
 LIFE_PER_FOOD = 100
-MAX_LIFE = 1000
+MAX_LIFE = 2000
 
 REWARD_FOOD = 25.0
 FOOD_REWARD_LENGTH_MULTIPLIER = 0.1
@@ -91,8 +103,11 @@ ADAPTIVE_SCORE_BOOST = 0.045
 ADAPTIVE_SCORE_DECAY = 0.015
 ADAPTIVE_SAFETY_BIAS_CAP = 1.0
 ADAPTIVE_REWARD_BIAS_CAP = 0.5
+ADAPTIVE_SCORE_MARGIN = 3.0
+ADAPTIVE_FORCE_DEADBAND = 0.005
 
 PENALTY_WALL_HUG = -0.5
+WALL_HUG_PENALTY_FOOD_FACTOR = 0.3  # scale applied when the food sits on the border
 PENALTY_TAIL_PROXIMITY = -2.0
 DISTANCE_REWARD_SCALAR = 1.0
 MAX_DISTANCE_REWARD_DELTA = 4.0
@@ -110,6 +125,15 @@ MEMORY_MAX_ENTRIES = 90000
 MEMORY_RECENCY_WEIGHT = 0.001
 MEMORY_SAVE_INTERVAL = 1
 
+
+# Symbolic-memory keying (v3 hybrid keys)
+# - "compact keys" generalize across snake lengths by using constant-size local features.
+# - legacy fallback allows continued reuse of older v2 memory files.
+MEMORY_ENABLE_COMPACT_KEYS = True
+MEMORY_ENABLE_LEGACY_FALLBACK = True
+MEMORY_AGE_BINS = 4
+# Length bucket cutoffs (<= cutoff -> bucket index). Values should be monotonic.
+MEMORY_LENGTH_BUCKETS = (4, 8, 16, 32, 64)
 # Decision weights
 HEURISTIC_WEIGHT = 1.0
 RSM_WEIGHT = 0.1

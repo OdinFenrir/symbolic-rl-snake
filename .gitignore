@@ -29,6 +29,8 @@ state/*.bak
 state/*
 !state/.gitkeep
 
+# telemetry runs & benchmarks
+runs/
 # python caches
 __pycache__/
 *.pyc

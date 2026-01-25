@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import heapq
 import logging
-import random
-from collections import deque
+from collections import defaultdict, deque
 from functools import lru_cache
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
@@ -47,25 +46,29 @@ class AdaptiveTuner:
 
         avg_forced = sum(self.forced_history) / len(self.forced_history)
         delta_forced = avg_forced - config.ADAPTIVE_TARGET_FORCED_RATE
-        self.safety_bias = _clamp(
-            self.safety_bias + delta_forced * config.ADAPTIVE_SAFETY_ADJUST_SCALE,
-            -config.ADAPTIVE_SAFETY_BIAS_CAP,
-            config.ADAPTIVE_SAFETY_BIAS_CAP,
-        )
-        self.reward_bias = _clamp(
-            self.reward_bias - delta_forced * config.ADAPTIVE_REWARD_ADJUST_SCALE,
-            -config.ADAPTIVE_REWARD_BIAS_CAP,
-            config.ADAPTIVE_REWARD_BIAS_CAP,
-        )
+        if abs(delta_forced) > config.ADAPTIVE_FORCE_DEADBAND:
+            self.safety_bias = _clamp(
+                self.safety_bias + delta_forced * config.ADAPTIVE_SAFETY_ADJUST_SCALE,
+                -config.ADAPTIVE_SAFETY_BIAS_CAP,
+                config.ADAPTIVE_SAFETY_BIAS_CAP,
+            )
+            self.reward_bias = _clamp(
+                self.reward_bias - delta_forced * config.ADAPTIVE_REWARD_ADJUST_SCALE,
+                -config.ADAPTIVE_REWARD_BIAS_CAP,
+                config.ADAPTIVE_REWARD_BIAS_CAP,
+            )
 
         if score > self.best_score:
             self.best_score = score
+        baseline = sum(self.score_history) / len(self.score_history)
+        diff = score - baseline
+        if diff >= config.ADAPTIVE_SCORE_MARGIN:
             self.reward_bias = _clamp(
                 self.reward_bias + config.ADAPTIVE_SCORE_BOOST,
                 -config.ADAPTIVE_REWARD_BIAS_CAP,
                 config.ADAPTIVE_REWARD_BIAS_CAP,
             )
-        else:
+        elif diff <= -config.ADAPTIVE_SCORE_MARGIN:
             self.reward_bias = _clamp(
                 self.reward_bias - config.ADAPTIVE_SCORE_DECAY,
                 -config.ADAPTIVE_REWARD_BIAS_CAP,
@@ -92,7 +95,8 @@ class SnakeAgent:
             (1, 0): "down",
             (-1, 0): "up",
         }
-        self.rng = random.Random(seed)
+        self.seed = seed
+        self._move_priority = {move: idx for idx, move in enumerate(self.actions.keys())}
         self.symbolic_memory = SymbolicMemory()
 
         self.total_rsm_depth = 0
@@ -116,6 +120,13 @@ class SnakeAgent:
         self.safety_forced = 0
         self._ep_safety_rejects = 0
         self._ep_safety_forced = 0
+        self._ep_rsm_hits = 0
+
+        self._memory_hits = 0
+        self._memory_lookups = 0
+        self._memory_influence_sum = 0.0
+        self._memory_influence_count = 0
+        self._reject_reasons: Dict[str, int] = defaultdict(int)
 
         # Short-term loop breaking (local-only; resets each episode)
         self._recent_heads: Deque[Cell] = deque(maxlen=32)
@@ -131,6 +142,20 @@ class SnakeAgent:
 
         self._recent_heads.clear()
         self._recent_moves.clear()
+        self._ep_rsm_hits = 0
+        self._memory_hits = 0
+        self._memory_lookups = 0
+        self._memory_influence_sum = 0.0
+        self._memory_influence_count = 0
+        self._reject_reasons.clear()
+
+    def _record_reject_reason(self, reason: str) -> None:
+        self._reject_reasons[reason] += 1
+
+
+    def reset_memory(self, *, delete_files: bool = False) -> None:
+        """Reset symbolic memory (in-memory) and optionally delete on-disk files."""
+        self.symbolic_memory.reset(delete_files=delete_files)
 
     def end_episode_stats(self) -> dict:
         """Return per-episode instrumentation stats."""
@@ -139,7 +164,7 @@ class SnakeAgent:
             "safety_forced": int(self._ep_safety_forced),
         }
 
-    def record_episode_stats(self, score: int, steps: int) -> dict:
+    def record_episode_stats(self, score: int, steps: int, observe_tuner: bool = True) -> dict:
         stats = self.end_episode_stats()
         forced = stats.get("safety_forced", 0)
         forced_rate = float(forced) / max(1, steps) if steps else 0.0
@@ -148,10 +173,35 @@ class SnakeAgent:
                 "score": score,
                 "steps": steps,
                 "forced_rate": forced_rate,
+                "rsm_prior_hits": int(self._ep_rsm_hits),
             }
         )
-        self.tuner.observe_episode(score, forced_rate)
+        if observe_tuner:
+            self.tuner.observe_episode(score, forced_rate)
+        stats.update(self._memory_stats())
+        stats.update(self._reject_reason_stats())
         return stats
+
+    def _memory_stats(self) -> Dict[str, Any]:
+        hits = int(self._memory_hits)
+        lookups = int(self._memory_lookups)
+        misses = max(0, lookups - hits)
+        hit_rate = float(hits) / float(lookups) if lookups else 0.0
+        influence_mean = (
+            float(self._memory_influence_sum) / float(self._memory_influence_count)
+            if self._memory_influence_count
+            else 0.0
+        )
+        return {
+            "memory_hits": hits,
+            "memory_lookups": lookups,
+            "memory_misses": misses,
+            "memory_hit_rate": hit_rate,
+            "memory_influence_mean": influence_mean,
+        }
+
+    def _reject_reason_stats(self) -> Dict[str, int]:
+        return {f"reject_{reason}": count for reason, count in self._reject_reasons.items()}
 
     # ----------------------------
     # Utilities
@@ -256,11 +306,25 @@ class SnakeAgent:
                 break
         return gap
 
-    def _edge_gap_penalty(self, next_head: Cell, move: Move, blocked: Set[Cell], snake_len: int) -> float:
+    def _edge_gap_penalty(
+        self,
+        next_head: Cell,
+        move: Move,
+        blocked: Set[Cell],
+        snake_len: int,
+        food: Optional[Cell],
+    ) -> float:
         if snake_len < config.EDGE_GAP_MIN_LENGTH:
             return 0.0
         if self._wall_distance(next_head) > config.EDGE_PROXIMITY:
             return 0.0
+        if food is not None:
+            food_on_border_row = food[0] in (0, config.BOARD_SIZE - 1)
+            food_on_border_col = food[1] in (0, config.BOARD_SIZE - 1)
+            if food_on_border_row and next_head[0] == food[0]:
+                return 0.0
+            if food_on_border_col and next_head[1] == food[1]:
+                return 0.0
 
         perp_a = (move[1], -move[0])
         perp_b = (-move[1], move[0])
@@ -413,20 +477,31 @@ class SnakeAgent:
             # - Eating is high risk: require sufficient reachable space.
             # - Non-eat moves: allow temporary disconnection if head component remains comfortably large,
             #   but avoid creating large new pockets while disconnected.
+            reason = None
             if ate:
-                ok = (reachable >= (len(sim_snake) + int(self.eat_reach_slack)))
+                if reachable >= (len(sim_snake) + int(self.eat_reach_slack)):
+                    ok = True
+                else:
+                    ok = False
+                    reason = "reject_eat_space"
             else:
-                ok = bool(tail_ok) or (reachable >= (len(sim_snake) + 2))
-
-                if (not tail_ok) and (pocket_delta_raw > 0):
-                    # Dynamic cutoff: be slightly more tolerant when short / when starving.
-                    cutoff = 7 + (2 if len(sim_snake) < self.long_snake_len else 0) + int(round(urgency * 3.0))
-                    if pocket_delta_raw > cutoff:
-                        ok = False
+                tail_condition = tail_ok
+                open_condition = reachable >= (len(sim_snake) + 2)
+                ok = tail_condition or open_condition
+                if not ok:
+                    reason = "reject_tail_unreachable"
+                else:
+                    pocket_delta_raw = pocket - baseline_pocket
+                    if not tail_ok and pocket_delta_raw > 0:
+                        cutoff = 7 + (2 if len(sim_snake) < self.long_snake_len else 0) + int(round(urgency * 3.0))
+                        if pocket_delta_raw > cutoff:
+                            ok = False
+                            reason = "reject_pocket_small"
 
             ok_map[move] = ok
             if not ok:
                 rejected_this_step += 1
+                self._record_reject_reason(reason or "reject_general")
             else:
                 ok_any = True
 
@@ -465,7 +540,7 @@ class SnakeAgent:
                     score += center_bonus
 
             blocked_next = set(sim_snake)
-            score += self._edge_gap_penalty(next_head, move, blocked_next, len(sim_snake))
+            score += self._edge_gap_penalty(next_head, move, blocked_next, len(sim_snake), food)
 
             meta[move] = {
                 "reachable": float(reachable),
@@ -526,6 +601,11 @@ class SnakeAgent:
         return penalty
 
 
+    def _select_deterministic_move(self, candidates: list[Move]) -> Move:
+        """Return the highest-priority move using the deterministic priority map."""
+        return min(candidates, key=lambda mv: self._move_priority.get(mv, 0))
+
+
     def _combine_scores(
         self,
         heuristic_scores: Dict[Move, float],
@@ -536,6 +616,8 @@ class SnakeAgent:
         snake_head: Cell,
     ) -> Tuple[Move, Dict[Move, float]]:
         final_scores: Dict[Move, float] = {}
+
+        r_scores_map: Dict[Move, float] = {}
 
         h_min = min(heuristic_scores.values()) if heuristic_scores else 0.0
         h_max = max(heuristic_scores.values()) if heuristic_scores else 0.0
@@ -558,6 +640,7 @@ class SnakeAgent:
             h_score = h_norm * float(config.HEURISTIC_WEIGHT)
 
             r_score = float(rsm_scores.get(move, 0.0)) * float(config.RSM_WEIGHT)
+            r_scores_map[move] = r_score
             bonus = float(config.A_STAR_BONUS) * h_norm if (a_star_move and move == a_star_move) else 0.0
             if (
                 a_star_move
@@ -569,7 +652,10 @@ class SnakeAgent:
 
         best_score = max(final_scores.values())
         best_moves = [m for m, s in final_scores.items() if s == best_score]
-        best = self.rng.choice(best_moves)
+        best = self._select_deterministic_move(best_moves)
+        best_r_score = r_scores_map.get(best, 0.0)
+        self._memory_influence_sum += best_r_score
+        self._memory_influence_count += 1
         return best, final_scores
 
     # ----------------------------
@@ -585,15 +671,15 @@ class SnakeAgent:
         if not self._recent_heads or self._recent_heads[0] != snake[0]:
             self._recent_heads.appendleft(snake[0])
 
-        # Build symbolic state for memory/RSM, but override safe_moves to match our real rule.
+        # Build symbolic state for memory/RSM (include segment ages so keying is consistent),
+        # but override safe_moves to match our real rule.
         segment_ages = segment_age_sequence(snake)
-        pre_state = self.symbolic_memory.create_symbolic_state(snake, food, direction)
-        pre_state["segment_ages"] = segment_ages
+        pre_state = self.symbolic_memory.create_symbolic_state(snake, food, direction, segment_ages=segment_ages)
         pre_state["safe_moves"] = safe_moves
 
         debug_info: Dict[str, Any] = {}
         if not safe_moves:
-            return self.rng.choice(list(self.actions.keys())), debug_info
+            return self._select_deterministic_move(list(self.actions.keys())), debug_info
         if len(safe_moves) == 1:
             return safe_moves[0], debug_info
 
@@ -601,7 +687,10 @@ class SnakeAgent:
 
         rsm_depth = max(config.RSM_MIN_DEPTH, min(config.RSM_MAX_DEPTH, len(snake) // 4))
         self.total_rsm_depth += rsm_depth
-        rsm_scores = self.symbolic_memory.recursive_reasoning(pre_state, depth=rsm_depth)
+        rsm_scores, rsm_hits, rsm_lookups = self.symbolic_memory.recursive_reasoning(pre_state, depth=rsm_depth)
+        self._ep_rsm_hits += int(rsm_hits)
+        self._memory_hits += int(rsm_hits)
+        self._memory_lookups += int(rsm_lookups)
 
         obstacles = set(snake)
         if len(snake) > 1:
@@ -619,7 +708,7 @@ class SnakeAgent:
 
         best_score = max(final_scores.values())
         best_moves = [m for m, s in final_scores.items() if s == best_score]
-        best = self.rng.choice(best_moves)
+        best = self._select_deterministic_move(best_moves)
 
         # Update short-term history with the chosen transition.
         self._recent_moves.appendleft(best)
