@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
 
       - name: Smoke test (headless)
         env:
@@ -31,3 +31,4 @@ jobs:
       - name: Benchmark train+eval
         run: |
           python scripts/run_benchmark.py --seed 1 --train-games 10 --eval-games 5
+
