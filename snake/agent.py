@@ -468,6 +468,12 @@ class SnakeAgent:
                 d_after = abs(next_head[0] - food[0]) + abs(next_head[1] - food[1])
                 score += reward_scale * 4.0 * urgency * float(base_food_dist - d_after)
 
+            # Always provide a small progress-to-food signal to reduce dithering
+            # when life is high (prevents repeatedly dodging the last step).
+            if food is not None and urgency <= 0.0:
+                d_after = abs(next_head[0] - food[0]) + abs(next_head[1] - food[1])
+                score += reward_scale * 1.5 * float(base_food_dist - d_after)
+
             # Simulate and evaluate topology.
             sim_snake, ate = self._simulate_step(snake, move, food)
             reachable, _total_open, tail_ok, pocket = self._escape_metrics(sim_snake, ate_food=ate)
@@ -479,11 +485,19 @@ class SnakeAgent:
             #   but avoid creating large new pockets while disconnected.
             reason = None
             if ate:
-                if reachable >= (len(sim_snake) + int(self.eat_reach_slack)):
-                    ok = True
-                else:
-                    ok = False
+                ok = reachable >= (len(sim_snake) + int(self.eat_reach_slack))
+                if not ok:
+                    # One-tick-later check (tail will move next tick).
+                    reachable_future, _to, _tail_ok_future, _pocket_future = self._escape_metrics(
+                        sim_snake, ate_food=False
+                    )
+                    ok = reachable_future >= (len(sim_snake) + 1)
+
+                if not ok:
                     reason = "eat_space"
+                else:
+                    # If safe to eat, bias toward committing to the eat.
+                    score += reward_scale * 0.4 * float(config.REWARD_FOOD)
             else:
                 tail_condition = tail_ok
                 open_condition = reachable >= (len(sim_snake) + 2)
