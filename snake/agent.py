@@ -663,7 +663,7 @@ class SnakeAgent:
         final_scores: Dict[Move, float] = {}
         for move in safe_moves:
             memory_bonus = 0.0
-            if best_h - h_scores.get(move, 0.0) <= eps:
+            if best_h - base_scores.get(move, 0.0) <= eps:
                 stats = memory_action_stats.get(move, {})
                 count = int(stats.get("count", 0))
                 avg_reward = float(stats.get("avg_reward", 0.0))
