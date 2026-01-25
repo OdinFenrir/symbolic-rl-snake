@@ -453,6 +453,10 @@ class SnakeAgent:
         if food is not None:
             base_food_dist = abs(snake[0][0] - food[0]) + abs(snake[0][1] - food[1])
 
+        base_tail_dist = 0
+        if len(snake) > 1:
+            base_tail_dist = abs(snake[0][0] - snake[-1][0]) + abs(snake[0][1] - snake[-1][1])
+
         for move in safe_moves:
             next_head = (snake[0][0] + move[0], snake[0][1] + move[1])
 
@@ -579,6 +583,22 @@ class SnakeAgent:
             blocked_next = set(sim_snake)
             score += self._edge_gap_penalty(next_head, move, blocked_next, len(sim_snake), food)
 
+            # --- Pocket wait / tail stall mode ---
+            # If tail isn't currently reachable but we have slack space, stop trying to "escape to food".
+            # Instead, zig-zag to burn steps while the tail clears the corridor.
+            if (not ate) and (tail_ok is False) and (slack >= 0) and (pocket > 0) and (urgency < 0.5):
+                tail = sim_snake[-1]
+                tail_dist = abs(next_head[0] - tail[0]) + abs(next_head[1] - tail[1])
+
+                # Prefer moves that INCREASE distance from tail (zig-zag away).
+                score += reward_scale * 1.25 * float(tail_dist - base_tail_dist)
+
+                # Cancel the non-urgent "progress-to-food" pull while pocket-stalling,
+                # otherwise the agent keeps probing the exit and self-traps.
+                if food is not None and urgency <= 0.0:
+                    d_after = abs(next_head[0] - food[0]) + abs(next_head[1] - food[1])
+                    score -= reward_scale * 1.0 * float(base_food_dist - d_after)
+
             meta[move] = {
                 "reachable": float(reachable),
                 "pocket": float(pocket),
@@ -689,6 +709,14 @@ class SnakeAgent:
                 and heuristic_meta.get(move, {}).get("ok", 0.0) > 0
             ):
                 bonus += float(config.SAFE_PATH_BONUS)
+
+            # Dampen A* when we're intentionally pocket-stalling (tail not ok, pocket exists, not starving).
+            meta = heuristic_meta.get(move, {})
+            if a_star_move and move == a_star_move:
+                meta = heuristic_meta.get(move, {})
+                # Dampen A* when we're intentionally pocket-stalling (tail not ok, pocket exists, not starving).
+                if meta.get("pocket", 0.0) > 0.0 and meta.get("tail_ok", 1.0) < 0.5 and meta.get("urgency", 0.0) < 0.5:
+                    bonus *= 0.2
 
             base_scores[move] = h_score + bonus
 
