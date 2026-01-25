@@ -37,3 +37,6 @@ __pycache__/
 
 # pytest cache
 .pytest_cache/
+
+# determinism test artifacts
+tmp-determinism-*/

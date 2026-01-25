@@ -483,25 +483,25 @@ class SnakeAgent:
                     ok = True
                 else:
                     ok = False
-                    reason = "reject_eat_space"
+                    reason = "eat_space"
             else:
                 tail_condition = tail_ok
                 open_condition = reachable >= (len(sim_snake) + 2)
                 ok = tail_condition or open_condition
                 if not ok:
-                    reason = "reject_tail_unreachable"
+                    reason = "tail_unreachable"
                 else:
                     pocket_delta_raw = pocket - baseline_pocket
                     if not tail_ok and pocket_delta_raw > 0:
                         cutoff = 7 + (2 if len(sim_snake) < self.long_snake_len else 0) + int(round(urgency * 3.0))
                         if pocket_delta_raw > cutoff:
                             ok = False
-                            reason = "reject_pocket_small"
+                            reason = "pocket_small"
 
             ok_map[move] = ok
             if not ok:
                 rejected_this_step += 1
-                self._record_reject_reason(reason or "reject_general")
+                self._record_reject_reason(reason or "general")
             else:
                 ok_any = True
 
@@ -605,6 +605,12 @@ class SnakeAgent:
         """Return the highest-priority move using the deterministic priority map."""
         return min(candidates, key=lambda mv: self._move_priority.get(mv, 0))
 
+    def _memory_confidence(self, count: int) -> float:
+        if count < config.MIN_MEMORY_COUNT:
+            return 0.0
+        base = float(count - config.MIN_MEMORY_COUNT)
+        return min(1.0, base / 30.0)
+
 
     def _combine_scores(
         self,
@@ -614,10 +620,10 @@ class SnakeAgent:
         a_star_path: List[Cell],
         safe_moves: List[Move],
         snake_head: Cell,
+        memory_action_stats: Dict[Move, Dict[str, float]],
     ) -> Tuple[Move, Dict[Move, float]]:
-        final_scores: Dict[Move, float] = {}
-
-        r_scores_map: Dict[Move, float] = {}
+        base_scores: Dict[Move, float] = {}
+        h_scores: Dict[Move, float] = {}
 
         h_min = min(heuristic_scores.values()) if heuristic_scores else 0.0
         h_max = max(heuristic_scores.values()) if heuristic_scores else 0.0
@@ -631,16 +637,14 @@ class SnakeAgent:
                 a_star_move = (dr, dc)
 
         for move in safe_moves:
-            # Normalize heuristics robustly even if all values are negative.
             h_raw = float(heuristic_scores.get(move, h_min))
             if denom > 1e-9:
                 h_norm = (h_raw - float(h_min)) / float(denom)
             else:
                 h_norm = 0.5
             h_score = h_norm * float(config.HEURISTIC_WEIGHT)
+            h_scores[move] = h_score
 
-            r_score = float(rsm_scores.get(move, 0.0)) * float(config.RSM_WEIGHT)
-            r_scores_map[move] = r_score
             bonus = float(config.A_STAR_BONUS) * h_norm if (a_star_move and move == a_star_move) else 0.0
             if (
                 a_star_move
@@ -648,14 +652,33 @@ class SnakeAgent:
                 and heuristic_meta.get(move, {}).get("ok", 0.0) > 0
             ):
                 bonus += float(config.SAFE_PATH_BONUS)
-            final_scores[move] = h_score + r_score + bonus
+
+            base_scores[move] = h_score + bonus
+
+        best_h = max(base_scores.values())
+        min_h = min(base_scores.values())
+        spread = best_h - min_h
+        eps = max(config.ABS_HEURISTIC_EPS, spread * 0.10)
+
+        final_scores: Dict[Move, float] = {}
+        for move in safe_moves:
+            memory_bonus = 0.0
+            if best_h - h_scores.get(move, 0.0) <= eps:
+                stats = memory_action_stats.get(move, {})
+                count = int(stats.get("count", 0))
+                avg_reward = float(stats.get("avg_reward", 0.0))
+                conf = self._memory_confidence(count)
+                if conf > 0.0:
+                    clipped = max(-config.MEMORY_CLIP, min(config.MEMORY_CLIP, avg_reward))
+                    memory_bonus = float(config.MEMORY_WEIGHT) * float(conf) * clipped
+                    self._memory_influence_sum += abs(memory_bonus)
+                    self._memory_influence_count += 1
+
+            final_scores[move] = base_scores[move] + memory_bonus
 
         best_score = max(final_scores.values())
         best_moves = [m for m, s in final_scores.items() if s == best_score]
         best = self._select_deterministic_move(best_moves)
-        best_r_score = r_scores_map.get(best, 0.0)
-        self._memory_influence_sum += best_r_score
-        self._memory_influence_count += 1
         return best, final_scores
 
     # ----------------------------
@@ -687,10 +710,20 @@ class SnakeAgent:
 
         rsm_depth = max(config.RSM_MIN_DEPTH, min(config.RSM_MAX_DEPTH, len(snake) // 4))
         self.total_rsm_depth += rsm_depth
-        rsm_scores, rsm_hits, rsm_lookups = self.symbolic_memory.recursive_reasoning(pre_state, depth=rsm_depth)
+        action_stats = self.symbolic_memory.action_stats_for_state(pre_state)
+        max_count = max((info.get("count", 0) for info in action_stats.values()), default=0)
+        use_memory = max_count >= config.MIN_MEMORY_COUNT
+        if use_memory:
+            rsm_scores, rsm_hits, rsm_lookups, rsm_stats = self.symbolic_memory.recursive_reasoning(
+                pre_state, depth=rsm_depth, lookup_cache={}
+            )
+        else:
+            rsm_scores, rsm_hits, rsm_lookups, rsm_stats = {}, 0, 0, {}
         self._ep_rsm_hits += int(rsm_hits)
         self._memory_hits += int(rsm_hits)
         self._memory_lookups += int(rsm_lookups)
+        memory_action_stats = dict(action_stats)
+        memory_action_stats.update(rsm_stats)
 
         obstacles = set(snake)
         if len(snake) > 1:
@@ -699,7 +732,13 @@ class SnakeAgent:
         debug_info["a_star_path"] = a_star_path
 
         best, final_scores = self._combine_scores(
-            heuristic_scores, heuristic_meta, rsm_scores, a_star_path, safe_moves, snake[0]
+            heuristic_scores,
+            heuristic_meta,
+            rsm_scores,
+            a_star_path,
+            safe_moves,
+            snake[0],
+            memory_action_stats,
         )
 
         # Apply soft loop/oscillation penalties and re-select.

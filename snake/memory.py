@@ -246,14 +246,16 @@ class SymbolicMemory:
         self,
         state: Dict[str, Any],
         depth: int,
-    ) -> Tuple[Dict[Move, float], int, int]:
+        lookup_cache: Optional[Dict[Tuple, Optional[Dict[str, Any]]]] = None,
+    ) -> Tuple[Dict[Move, float], int, int, Dict[Move, Dict[str, float]]]:
         """Recursive lookahead using stored values as priors."""
         if depth == 0 or not state.get("safe_moves"):
-            return ({move: 0.0 for move in state.get("safe_moves", [])}, 0, 0)
+            return ({move: 0.0 for move in state.get("safe_moves", [])}, 0, 0, {})
 
         scores: Dict[Move, float] = defaultdict(float)
         hits = 0
         lookups = 0
+        action_stats: Dict[Move, Dict[str, float]] = {}
 
         # Prefer precomputed keys from the state when present.
         canonical_key = state.get("state_key")
@@ -272,7 +274,13 @@ class SymbolicMemory:
                 state.get("segment_ages"),
             )
 
-        state_data = self._lookup_entry(canonical_key, legacy_key) or {}
+        if lookup_cache is None:
+            lookup_cache = {}
+        cached = lookup_cache.get(canonical_key)
+        if cached is None:
+            cached = self._lookup_entry(canonical_key, legacy_key) or {}
+            lookup_cache[canonical_key] = cached
+        state_data = cached
         actions = state_data.get("actions", {}) if isinstance(state_data, dict) else {}
 
         for move in state["safe_moves"]:
@@ -292,10 +300,17 @@ class SymbolicMemory:
             action_info = actions.get(action_str)
             if isinstance(action_info, dict) and "avg_reward" in action_info:
                 hits += 1
-                scores[move] = float(action_info["avg_reward"])
+                avg_reward = float(action_info["avg_reward"])
+                scores[move] = avg_reward
+                action_stats[move] = {
+                    "avg_reward": avg_reward,
+                    "count": int(action_info.get("count", 0)),
+                }
 
             new_state = self.create_symbolic_state(temp_snake, next_food, move)
-            future_scores, future_hits, future_lookups = self.recursive_reasoning(new_state, depth - 1)
+            future_scores, future_hits, future_lookups, _ = self.recursive_reasoning(
+                new_state, depth - 1, lookup_cache=lookup_cache
+            )
             hits += future_hits
             lookups += future_lookups
 
@@ -304,7 +319,44 @@ class SymbolicMemory:
             else:
                 scores[move] += float(config.PENALTY_DEATH) * float(config.RSM_DECAY_FACTOR)
 
-        return scores, hits, lookups
+        return scores, hits, lookups, action_stats
+
+    def action_stats_for_state(
+        self,
+        state: Dict[str, Any],
+    ) -> Dict[Move, Dict[str, float]]:
+        canonical_key = state.get("state_key")
+        legacy_key = state.get("legacy_state_key")
+        if not isinstance(canonical_key, tuple) or not isinstance(legacy_key, tuple):
+            canonical_key = self.create_state_key(
+                state["snake_body"],
+                state.get("food"),
+                state["direction"],
+                state.get("segment_ages"),
+            )
+            legacy_key = self.create_legacy_state_key(
+                state["snake_body"],
+                state.get("food"),
+                state["direction"],
+                state.get("segment_ages"),
+            )
+        entry = self._lookup_entry(canonical_key, legacy_key) or {}
+        actions = entry.get("actions", {}) if isinstance(entry, dict) else {}
+        stats: Dict[Move, Dict[str, float]] = {}
+        for action_str, info in actions.items():
+            if not isinstance(info, dict):
+                continue
+            if "," not in action_str:
+                continue
+            try:
+                move = tuple(int(token) for token in action_str.split(","))
+            except ValueError:
+                continue
+            stats[move] = {
+                "count": int(info.get("count", 0)),
+                "avg_reward": float(info.get("avg_reward", 0.0)),
+            }
+        return stats
 
     # ----------------------------
     # Updates / pruning
