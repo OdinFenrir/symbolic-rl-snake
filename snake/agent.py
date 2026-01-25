@@ -485,27 +485,50 @@ class SnakeAgent:
             #   but avoid creating large new pockets while disconnected.
             reason = None
             if ate:
+                # Primary conservative check (tail does not move on eat tick).
                 ok = reachable >= (len(sim_snake) + int(self.eat_reach_slack))
+
                 if not ok:
-                    # One-tick-later check (tail will move next tick).
-                    reachable_future, _to, _tail_ok_future, _pocket_future = self._escape_metrics(
+                    # One-tick-later check: tail will move on the next tick if we don't eat again.
+                    reachable_future, _to, tail_ok_future, _pocket_future = self._escape_metrics(
                         sim_snake, ate_food=False
                     )
-                    ok = reachable_future >= (len(sim_snake) + 1)
+
+                    # Count immediate exits from the post-eat head (prevents eating into a 1-exit trap).
+                    future_safe = 0
+                    temp_snake = deque(sim_snake)
+                    for dr, dc in self.actions.keys():
+                        fh = (next_head[0] + dr, next_head[1] + dc)
+                        if self._in_bounds(fh) and fh not in temp_snake:
+                            future_safe += 1
+
+                    # Accept if the tail becomes reachable (good “follow-tail” escape),
+                    # or if reachable space is decent, AND we have at least two exits.
+                    ok = (tail_ok_future or reachable_future >= (len(sim_snake) + 1)) and future_safe >= 2
 
                 if not ok:
                     reason = "eat_space"
                 else:
                     # If safe to eat, bias toward committing to the eat.
-                    score += reward_scale * 0.4 * float(config.REWARD_FOOD)
+                    score += reward_scale * 0.7 * float(config.REWARD_FOOD)
             else:
+                slack = reachable - len(sim_snake)
+
                 tail_condition = tail_ok
                 open_condition = reachable >= (len(sim_snake) + 2)
                 ok = tail_condition or open_condition
+
                 if not ok:
-                    reason = "tail_unreachable"
+                    # If there is at least some slack space, don't hard-reject; just penalize.
+                    if slack >= 0:
+                        # Soft-accept: keep the move, but penalize it so it only wins when needed.
+                        ok = True
+                        score -= penalty_scale * 1.0 * (2.0 - min(2.0, float(slack)))
+                    else:
+                        reason = "tail_unreachable"
                 else:
                     pocket_delta_raw = pocket - baseline_pocket
+                    pocket_delta = pocket_delta_raw
                     if not tail_ok and pocket_delta_raw > 0:
                         cutoff = 7 + (2 if len(sim_snake) < self.long_snake_len else 0) + int(round(urgency * 3.0))
                         if pocket_delta_raw > cutoff:
@@ -530,7 +553,7 @@ class SnakeAgent:
             pocket_delta_eff = max(0, int(pocket_delta) - int(allow))
 
             score -= self.pocket_penalty * penalty_scale * float(pocket)
-            score -= self.pocket_delta_penalty * penalty_scale * float(pocket_delta_eff) * (2.0 if ate else 1.0)
+            score -= self.pocket_delta_penalty * penalty_scale * float(pocket_delta_eff) * (1.25 if ate else 1.0)
 
             if ok and pocket == 0:
                 score += 2.0
