@@ -361,66 +361,121 @@ class SymbolicMemory:
     # ----------------------------
     # Updates / pruning
     # ----------------------------
-    def update_memory(self, state: Dict[str, Any], action: Move, reward: float) -> None:
-        """Update state-action statistics."""
-        # Prefer cached keys.
+    def update_memory(
+        self,
+        state: Dict[str, Any],
+        action: Move,
+        reward: float,
+        next_state: Optional[Dict[str, Any]] = None,
+        done: bool = False,
+    ) -> None:
+        """Update state-action statistics.
+
+        The original implementation stored a running average of immediate rewards.
+        That tends to *reinforce stalling loops* (episodes that end via step_cap)
+        because those endings previously carried no negative learning signal.
+
+        This update applies a lightweight TD(0) target so the stored value is
+        effectively a Q-value estimate for (state, action):
+
+            Q(s,a) <- (1-alpha) Q(s,a) + alpha * (r + gamma * max_a' Q(s',a'))
+
+        Using a small step penalty and an explicit step-cap terminal penalty,
+        this encourages shorter, food-seeking trajectories and reduces looping.
+        """
+
+        # Count updates for recency-weighted pruning.
+        self.total_updates = int(self.total_updates) + 1
+
         canonical_key = state.get("state_key")
         legacy_key = state.get("legacy_state_key")
 
-        if not isinstance(canonical_key, tuple) or not isinstance(legacy_key, tuple):
-            canonical_key = self.create_state_key(
-                state["snake_body"],
-                state["food"],
-                state["direction"],
-                segment_ages=state.get("segment_ages"),
-            )
-            legacy_key = self.create_legacy_state_key(
-                state["snake_body"],
-                state["food"],
-                state["direction"],
-                segment_ages=state.get("segment_ages"),
-            )
+        # Backwards compatibility: some callers/tests provide raw state dicts with
+        # "snake_body" (deque/tuple) rather than a precomputed state_key.
+        if canonical_key is None or legacy_key is None:
+            snake_body = state.get("snake_body") or state.get("snake") or ()
+            snake_t = tuple(snake_body)
+            food = state.get("food")
+            direction = state.get("direction", (0, 1))
+            ages = state.get("segment_ages")
+            if ages is None:
+                try:
+                    ages = segment_age_sequence(snake_t)
+                except Exception:
+                    ages = ()
+            if canonical_key is None:
+                canonical_key = self.create_state_key(snake_t, food, direction, ages)
+            if legacy_key is None:
+                legacy_key = self.create_legacy_state_key(snake_t, food, direction, ages)
 
-        action_str = f"{action[0]},{action[1]}"
-        self.total_updates += 1
+        action_key = f"{action[0]},{action[1]}"
+        entry = self._lookup_entry(canonical_key, legacy_key)
 
-        if canonical_key not in self.memory:
-            compact_state = {k: v for k, v in state.items() if k != "snake_body"}
-            compact_state["key_version"] = MEMORY_FORMAT_VERSION
-            self.memory[canonical_key] = {
-                "state_info": compact_state,
+        if not isinstance(entry, dict):
+            entry = {
+                "last_seen": time.time(),
+                "last_visit_step": int(self.total_updates),
                 "actions": {},
                 "visits": 0,
-                "last_visit_step": 0,
+                "last_visit_step": int(self.total_updates),
             }
+            self.memory[canonical_key] = entry
 
-        state_data = self.memory[canonical_key]
-        state_data["visits"] += 1
-        state_data["last_visit_step"] = self.total_updates
-
-        actions = state_data.setdefault("actions", {})
-        if action_str not in actions:
-            actions[action_str] = {
+        actions = entry["actions"]
+        a = actions.setdefault(
+            action_key,
+            {
+                "avg_reward": 0.0,
                 "count": 0,
                 "total_reward": 0.0,
-                "avg_reward": 0.0,
-            }
+                "last_seen": time.time(),
+            },
+        )
 
-        action_data = actions[action_str]
-        action_data["count"] += 1
-        action_data["total_reward"] += float(reward)
+        # TD target
+        target = float(reward)
+        if (next_state is not None) and (not done):
+            next_key = next_state.get("state_key")
+            if next_key is None:
+                snake_body = next_state.get("snake_body") or next_state.get("snake") or ()
+                snake_t = tuple(snake_body)
+                food = next_state.get("food")
+                direction = next_state.get("direction", (0, 1))
+                ages = next_state.get("segment_ages")
+                if ages is None:
+                    try:
+                        ages = segment_age_sequence(snake_t)
+                    except Exception:
+                        ages = ()
+                next_key = self.create_state_key(snake_t, food, direction, ages)
+            target += float(config.MEMORY_GAMMA) * self._max_q_for_state_key(next_key)
 
-        alpha = 1.0 / action_data["count"]
-        action_data["avg_reward"] = (1 - alpha) * float(action_data["avg_reward"]) + alpha * float(reward)
+        a["count"] = int(a.get("count", 0)) + 1
+        a["total_reward"] = float(a.get("total_reward", 0.0)) + float(reward)
+        a["last_seen"] = time.time()
+        a["last_visit_step"] = int(self.total_updates)
 
-        # Maintain legacy->canonical mapping (no duplication of entries).
-        if canonical_key != legacy_key:
-            self.legacy_index[legacy_key] = canonical_key
+        # Slightly decaying alpha, capped by config.MEMORY_ALPHA
+        alpha = min(float(config.MEMORY_ALPHA), 1.0 / float(a["count"]))
+        old_q = float(a.get("avg_reward", 0.0))
+        a["avg_reward"] = (1.0 - alpha) * old_q + alpha * float(target)
 
+        entry["visits"] = int(entry.get("visits", 0)) + 1
+        entry["last_seen"] = time.time()
+        entry["last_visit_step"] = int(self.total_updates)
         self.is_modified = True
 
         if len(self.memory) > config.MEMORY_MAX_ENTRIES:
             self.prune_memory()
+
+    def _max_q_for_state_key(self, state_key: Any) -> float:
+        entry = self._lookup_entry(state_key, state_key)
+        if not isinstance(entry, dict):
+            return 0.0
+        actions = entry.get("actions", {})
+        if not actions:
+            return 0.0
+        return max(float(v.get("avg_reward", 0.0)) for v in actions.values())
 
     def prune_memory(self) -> None:
         """Prune memory based on recency-weighted utility."""

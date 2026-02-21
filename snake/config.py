@@ -89,6 +89,16 @@ FOOD_REWARD_POWER = 1.15
 
 PENALTY_DEATH = -40.0
 
+# Per-step shaping / anti-stall
+STEP_PENALTY = -0.005   # small constant time penalty to discourage loops
+STALL_PENALTY_START = 150  # steps since last food before extra stall penalty starts
+STALL_PENALTY = -0.02     # additional penalty applied each step after STALL_PENALTY_START
+PENALTY_STEP_CAP = -5.0   # applied when an episode ends by step cap
+
+# Temporal-difference style update for episodic memory (lightweight Q-learning)
+MEMORY_ALPHA = 0.15
+MEMORY_GAMMA = 0.90
+
 # Repeat penalty is applied per step *beyond* REPEAT_THRESHOLD.
 REPEAT_THRESHOLD = 8
 REPEAT_PENALTY_CAP_STEPS = 12
@@ -111,8 +121,9 @@ WALL_HUG_PENALTY_FOOD_FACTOR = 0.0  # no border penalty when chasing border food
 
 # Memory guardrails
 MIN_MEMORY_COUNT = 5
-MEMORY_CLIP = 1.0
-MEMORY_WEIGHT = 0.15
+MEMORY_CLIP = 0.7
+MEMORY_WEIGHT = 0.10
+MEMORY_OK_GATE = True  # Gate memory influence to "ok" moves when at least one ok move exists
 ABS_HEURISTIC_EPS = 0.02
 PENALTY_TAIL_PROXIMITY = -2.0
 DISTANCE_REWARD_SCALAR = 1.0
@@ -147,6 +158,18 @@ SAFE_PATH_BONUS = 1.5
 AGE_PROXIMITY_WEIGHT = 0.75
 A_STAR_BONUS = 3.0
 
+# ---------------------------------------------------------------------------
+# Anti-stall controls (agent-side)
+# ---------------------------------------------------------------------------
+# If the snake hasn't eaten for this many steps, we gradually increase urgency
+# (which re-enables food attraction/A* even when the pocket-stall heuristic is
+# active).
+STALL_URGENCY_STEPS = 160
+
+# Small novelty bonus for moving into a cell not visited since the last meal.
+# This only scales in when stall urgency is non-zero.
+NOVELTY_BONUS = 0.18
+
 # Recursive lookahead
 RSM_MIN_DEPTH = 2
 RSM_MAX_DEPTH = 4
@@ -170,6 +193,24 @@ def validate_config() -> None:
         ok = False
     if REPEAT_PENALTY_CAP_STEPS < 0:
         logger.error("REPEAT_PENALTY_CAP_STEPS must be >= 0")
+        ok = False
+    if INITIAL_LIFE <= 0:
+        logger.error("INITIAL_LIFE must be > 0")
+        ok = False
+    if MAX_LIFE <= 0:
+        logger.error("MAX_LIFE must be > 0")
+        ok = False
+    if MEMORY_ALPHA <= 0 or MEMORY_ALPHA > 1:
+        logger.error("MEMORY_ALPHA must be in (0, 1]")
+        ok = False
+    if MEMORY_GAMMA < 0 or MEMORY_GAMMA > 1:
+        logger.error("MEMORY_GAMMA must be in [0, 1]")
+        ok = False
+    if MEMORY_WEIGHT < 0:
+        logger.error("MEMORY_WEIGHT must be >= 0")
+        ok = False
+    if RSM_WEIGHT < 0:
+        logger.error("RSM_WEIGHT must be >= 0")
         ok = False
     if not ok:
         raise SystemExit(1)

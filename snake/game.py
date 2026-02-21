@@ -12,7 +12,7 @@ import textwrap
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Set, Tuple
 
 from . import config
 from .rules import legal_moves, is_legal_move, Move
@@ -82,7 +82,7 @@ class SnakeGame:
         self._preset_active_label: Optional[str] = None
         self.summary_command = [
             sys.executable,
-            str(self.repo_root / "compare_runs.py"),
+            str(self.repo_root / "scripts" / "compare_runs.py"),
             "--train",
             str(self.runs_dir / "train_preset.jsonl"),
             "--eval",
@@ -120,6 +120,10 @@ class SnakeGame:
             (r, c) for r in range(config.BOARD_SIZE) for c in range(config.BOARD_SIZE)
         }
         self.won = False
+        self.terminal_reason: Optional[str] = None
+        # Optional detail for terminal_reason == "collision".
+        # Examples: "wall", "self", "reverse", "tail_entry_eating".
+        self.collision_reason: Optional[str] = None
         self.reset()
 
     def _lerp_color(self, start: Tuple[int, int, int], end: Tuple[int, int, int], ratio: float) -> Tuple[int, int, int]:
@@ -149,8 +153,11 @@ class SnakeGame:
         self.snake: Deque[Tuple[int, int]] = deque([start_pos])
         self.direction = self.rng.choice([(0, 1), (1, 0), (0, -1), (-1, 0)])
         self.occupied_cells = {start_pos}
+        self.terminal_reason = None
+        self.collision_reason = None
         self.food = self._place_food()
         self.score = 0
+        self.steps_since_food = 0
         self.life = config.INITIAL_LIFE
         self.game_over = False
         self.consecutive_moves: Dict[str, int] = defaultdict(int)
@@ -162,6 +169,8 @@ class SnakeGame:
             logger.info("No space for food - snake wins")
             self.game_over = True
             self.won = True
+            self.terminal_reason = "win"
+            self.collision_reason = None
             return None
         # Random placement via RNG.
         return self.rng.choice(sorted(available_positions))
@@ -170,8 +179,41 @@ class SnakeGame:
         return self.food is not None and new_head == self.food
 
     def _check_collision(self, new_head: Tuple[int, int]) -> bool:
+        # Reset per-move detail; populated only when we detect an illegal move.
+        self.collision_reason = None
+
+        head_r, head_c = new_head
+        brd = int(config.BOARD_SIZE)
+
+        # 1) Wall check (fast, independent of other rules)
+        if head_r < 0 or head_c < 0 or head_r >= brd or head_c >= brd:
+            self.collision_reason = "wall"
+            return True
+
+        # 2) Reverse check (engine forbids reversing into yourself when length>1)
         move = (new_head[0] - self.snake[0][0], new_head[1] - self.snake[0][1])
-        return not is_legal_move(self.snake, self.food, move, self.direction)
+        if len(self.snake) > 1:
+            dr, dc = self.direction
+            if move == (-dr, -dc) and (dr != 0 or dc != 0):
+                self.collision_reason = "reverse"
+                return True
+
+        # 3) Self / tail-entry checks. Tail entry is legal only when NOT eating.
+        would_eat = self._would_eat(new_head)
+        tail = self.snake[-1] if self.snake else None
+        if new_head in self.occupied_cells:
+            if tail is not None and new_head == tail and not would_eat:
+                # Legal tail entry when the tail will move away.
+                pass
+            else:
+                self.collision_reason = "tail_entry_eating" if (tail is not None and new_head == tail and would_eat) else "self"
+                return True
+
+        # 4) Fall back to the canonical rules check (keeps us consistent if rules evolve)
+        legal = is_legal_move(self.snake, self.food, move, self.direction)
+        if not legal and self.collision_reason is None:
+            self.collision_reason = "illegal"
+        return not legal
 
     def _update_snake(self, action: Tuple[int, int]) -> Tuple[Tuple[int, int], bool]:
 
@@ -190,9 +232,11 @@ class SnakeGame:
 
         if ate_food:
             self.score += 1
+            self.steps_since_food = 0
             self.life = min(self.life + config.LIFE_PER_FOOD, config.MAX_LIFE)
         else:
             self.snake.pop()
+            self.steps_since_food += 1
 
         self.occupied_cells = set(self.snake)
 
@@ -260,13 +304,24 @@ class SnakeGame:
         if self._check_collision(new_head):
             self.game_over = True
             self.life = 0
+            self.terminal_reason = "collision"
             return config.PENALTY_DEATH
 
         _, ate_food = self._update_snake(action)
         if self.life <= 0:
             self.game_over = True
+            if not self.won and not self.terminal_reason:
+                self.terminal_reason = "starvation"
             return config.PENALTY_DEATH
-        return self._compute_reward(ate_food, new_head, pre_move_state)
+        reward = self._compute_reward(ate_food, new_head, pre_move_state)
+
+        # Per-step shaping: discourage endless cycling/stalling
+        if not ate_food:
+            reward += config.STEP_PENALTY
+            if self.steps_since_food >= config.STALL_PENALTY_START:
+                reward += config.STALL_PENALTY
+
+        return reward
 
     def render(self, debug_info: Optional[Dict[str, Any]] = None) -> None:
         if not self.render_enabled or self.screen is None or self.pygame is None:
